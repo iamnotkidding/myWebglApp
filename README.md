@@ -1,6 +1,6 @@
 # myWebgl
 
-[webgpu.com](https://www.webgpu.com/) 쇼케이스에서 영감을 받은 실시간 GPU 그래픽 데모 7종을 담은 Android 앱입니다.
+[webgpu.com](https://www.webgpu.com/) 쇼케이스에서 영감을 받은 실시간 GPU 그래픽 데모 9종을 담은 Android 앱입니다.
 모든 데모는 APK에 포함된 순수 WebGL2/WebGPU 코드로 동작하며 **네트워크 없이(오프라인)** 실행됩니다
 (앱에 `INTERNET` 권한 없음, WebView 네트워크 차단).
 
@@ -13,6 +13,8 @@
 | 5 | `shadow-play` | Shadow Play | SDF 소프트 섀도, AO |
 | 6 | `path-tracer` | Progressive Path Tracer | 몬테카를로 경로 추적, NEE |
 | 7 | `boids` | WebGPU Compute Boids | WGSL 컴퓨트 (미지원 시 WebGL2 대체) |
+| 8 | `life-sim` | 3D Life Sim | [kajukabla/3d-life-sim](https://github.com/kajukabla/3d-life-sim) 원본 번들 (MIT), WebGPU 필요 |
+| 9 | `fluid` | WebGPU Fluid | Stable Fluids 컴퓨트 셰이더 자체 구현, WebGPU 필요 |
 
 ## 빌드
 
@@ -43,7 +45,7 @@ adb shell am start -n $A/.MainActivity -a $A.action.START \
 
 | extra | 값 | 설명 |
 |-------|----|------|
-| `demo` | `all`(기본), id, 파일명, 번호(1–7), 쉼표 목록 | 실행할 데모와 순서 |
+| `demo` | `all`(기본), id, 파일명, 번호(1–9), 쉼표 목록 | 실행할 데모와 순서 |
 | `duration` | `90`, `90s`, `5m`, `1h30m`, `0`/`off` | 데모당 테스트 시간. 0이면 STOP 전까지 계속 |
 | `loops` | `1`(기본)…, `0`/`inf` | 데모 목록 반복 횟수 |
 | `scale` | `auto`, `0.1`–`1`, `10`–`100`, `50%` | 렌더 해상도 고정(자동 조절 끔) |
@@ -81,6 +83,8 @@ adb shell am start -n $A/.MainActivity -a $A.action.SETTINGS                   #
 | shadow-play | `light`=0 촛불 / 1 달빛 / 2 네온 / 3 백색, `shadow`=0 보통 / 1 선명 / 2 흐림 |
 | path-tracer | `material`=0 유리 / 1 거울 / 2 무광 / 3 골드, `lighting`=0 따뜻한 / 1 차가운 / 2 무드 |
 | boids | `backend`=webgpu / webgl, `count`=입자 수(64 단위) |
+| life-sim | 원본 옵션: `settings`=file-default-json / file-electric-current-json / file-ice-flower-json / file-viridian-aurora-json (또는 `Ice%20Flower`처럼 이름), `particles`=입자 수, `playing`=0 |
+| fluid | `color`=0 무지개 / 1 네온 / 2 불꽃 / 3 바다, `vortex`=0 보통 / 1 강하게 / 2 끄기, `shading`=0 입체 / 1 평면, `trails`=0 보통 / 1 길게, `sim`=격자(기본 128), `dye`=물감 해상도(기본 768) |
 
 번호 대신 버튼에 표시되는 이름(예: `time=한낮`)도 쓸 수 있습니다.
 
@@ -104,3 +108,15 @@ adb shell cat /sdcard/Android/data/com.qa.mywebgl/files/results.jsonl  # 누적 
 
 `outcome`은 `finished`(시간 종료) 또는 `stopped:<사유>`(back, intent)이며, WebView 렌더러가 죽으면
 `report.failed=true`로 기록하고 다음 데모로 넘어갑니다. 테스트 중에는 화면이 꺼지지 않습니다.
+
+`life-sim`과 `fluid`는 WebGPU 전용입니다. WebGPU가 없는 기기(예: 에뮬레이터)에서는 안내 메시지가 표시되고 결과에 `failed`로 기록됩니다.
+`life-sim`은 `scale` 설정을 적용하지 않으며(원본이 자체적으로 해상도·입자 수를 조절), `hud=false`이면 원본의 ☰ 메뉴를 숨깁니다.
+
+## 서드파티 / 출처
+
+- **3D Life Sim** — © 2026 kajukabla, MIT License. 커밋 `c482627`을 빌드해 `app/src/main/assets/demos/life-sim/`에 포함했습니다.
+  라이선스 전문은 같은 폴더의 `LICENSE.txt`, 포함된 Fluoddity(MIT) 등의 고지는 `THIRD_PARTY_NOTICES.md`에 있습니다.
+  다시 빌드하려면 `tools/update-life-sim.sh [commit]`을 실행합니다. 앱 연동용 `life-sim-hook.js`(fps 통계, HUD 숨김)만 추가했고 원본 코드는 수정하지 않았습니다.
+- **WebGPU Fluid** — [kishimisu/WebGPU-Fluid-Simulation](https://github.com/kishimisu/WebGPU-Fluid-Simulation)에서 영감을 받았지만,
+  해당 저장소에는 라이선스가 없어 코드를 가져오지 않고 공개 알고리즘(Jos Stam *Stable Fluids*, GPU Gems 38장)으로 새로 구현했습니다.
+- 나머지 데모 1–7은 [webgpu.com](https://www.webgpu.com/) 쇼케이스 작품의 아이디어만 참고한 자체 구현입니다.

@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>WebGPU Fluid</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<script src="common.js"></script>
+<script>
+'use strict';
+// Eulerian "stable fluids" (Stam 1999 / GPU Gems ch. 38) written from scratch for WebGPU:
+// every step is a compute pass over rgba16float storage textures — splat forces, vorticity
+// confinement, divergence, Jacobi pressure solve, projection, then semi-Lagrangian advection of
+// velocity and dye. The dye is drawn with a height-field lighting pass so it reads as glossy ink.
+// Grid convention: texel (0,0) is the top-left, +y points down, velocity is in sim texels / s.
+
+const SIM_SHORT = D.clamp(Math.round(D.param('sim', 128)), 32, 512); // velocity/pressure grid, shorter side
+const DYE_SHORT = D.clamp(Math.round(D.param('dye', 768)), 64, 2048); // dye resolution, shorter side
+const JACOBI = 24;
+const MAX_SPLATS = 16;
+
+const s = D.surface({ scale: 1, minScale: 0.6, maxScale: 1 });
+const cam = D.orbit(s.canvas, { rotate: false, autoRotate: 0 }); // only for tap/drag bookkeeping
+
+const COMMON = /* wgsl */ `
+struct P {
+  simSize: vec2f, dyeSize: vec2f,
+  dt: f32, velDiss: f32, dyeDiss: f32, curl: f32,
+  pDecay: f32, splats: u32, aspect: f32, time: f32,
+};
+fn ld(t: texture_2d<f32>, c: vec2i) -> vec4f {
+  let s = vec2i(textureDimensions(t));
+  return textureLoad(t, clamp(c, vec2i(0), s - vec2i(1)), 0);
+}
+`;
+const HEAD = `@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let d = textureDimensions(dst);
+  if (id.x >= d.x || id.y >= d.y) { return; }
+  let c = vec2i(id.xy);
+  let uv = (vec2f(id.xy) + 0.5) / vec2f(d);`;
+const OUT = (n) => `@group(0) @binding(${n}) var dst: texture_storage_2d<rgba16float, write>;`;
+const TEX = (n, name) => `@group(0) @binding(${n}) var ${name}: texture_2d<f32>;`;
+const UNI = (n) => `@group(0) @binding(${n}) var<uniform> p: P;`;
+
+const SHADERS = {
+  splatVel: `${UNI(0)}
+struct Splat { a: vec4f, b: vec4f };  // a = (x, y, fx, fy) in uv / texels per s, b = (r, g, b, radius)
+@group(0) @binding(1) var<uniform> S: array<Splat, ${MAX_SPLATS}>;
+${TEX(2, 'src')} ${OUT(3)}
+${HEAD}
+  var acc = ld(src, c);
+  for (var i = 0u; i < p.splats; i++) {
+    var dd = uv - S[i].a.xy;
+    dd.x *= p.aspect;
+    acc += vec4f(S[i].a.zw, 0.0, 0.0) * exp(-dot(dd, dd) / S[i].b.w);
+  }
+  textureStore(dst, c, acc);
+}`,
+  splatDye: `${UNI(0)}
+struct Splat { a: vec4f, b: vec4f };
+@group(0) @binding(1) var<uniform> S: array<Splat, ${MAX_SPLATS}>;
+${TEX(2, 'src')} ${OUT(3)}
+${HEAD}
+  var acc = ld(src, c);
+  for (var i = 0u; i < p.splats; i++) {
+    var dd = uv - S[i].a.xy;
+    dd.x *= p.aspect;
+    acc += vec4f(S[i].b.rgb, 0.0) * exp(-dot(dd, dd) / S[i].b.w);
+  }
+  textureStore(dst, c, vec4f(acc.rgb, 1.0));
+}`,
+  curl: `${TEX(0, 'vel')} ${OUT(1)}
+${HEAD}
+  let L = ld(vel, c - vec2i(1, 0)).y;
+  let R = ld(vel, c + vec2i(1, 0)).y;
+  let B = ld(vel, c - vec2i(0, 1)).x;
+  let T = ld(vel, c + vec2i(0, 1)).x;
+  textureStore(dst, c, vec4f(0.5 * (R - L - T + B), 0.0, 0.0, 1.0));
+}`,
+  vorticity: `${UNI(0)} ${TEX(1, 'vel')} ${TEX(2, 'curl')} ${OUT(3)}
+${HEAD}
+  let L = abs(ld(curl, c - vec2i(1, 0)).x);
+  let R = abs(ld(curl, c + vec2i(1, 0)).x);
+  let B = abs(ld(curl, c - vec2i(0, 1)).x);
+  let T = abs(ld(curl, c + vec2i(0, 1)).x);
+  let C = ld(curl, c).x;
+  // Confinement force (N × ω) pushes velocity to keep small eddies spinning.
+  var f = 0.5 * vec2f(T - B, R - L);
+  f = f / (length(f) + 1e-4) * p.curl * C;
+  f.y = -f.y;
+  let v = clamp(ld(vel, c).xy + f * p.dt, vec2f(-1000.0), vec2f(1000.0));
+  textureStore(dst, c, vec4f(v, 0.0, 1.0));
+}`,
+  divergence: `${TEX(0, 'vel')} ${OUT(1)}
+${HEAD}
+  let C = ld(vel, c).xy;
+  var L = ld(vel, c - vec2i(1, 0)).x;
+  var R = ld(vel, c + vec2i(1, 0)).x;
+  var B = ld(vel, c - vec2i(0, 1)).y;
+  var T = ld(vel, c + vec2i(0, 1)).y;
+  // Solid walls: mirror the normal velocity at the border.
+  if (c.x == 0) { L = -C.x; }
+  if (c.x == i32(d.x) - 1) { R = -C.x; }
+  if (c.y == 0) { B = -C.y; }
+  if (c.y == i32(d.y) - 1) { T = -C.y; }
+  textureStore(dst, c, vec4f(0.5 * (R - L + T - B), 0.0, 0.0, 1.0));
+}`,
+  decay: `${UNI(0)} ${TEX(1, 'pres')} ${OUT(2)}
+${HEAD}
+  textureStore(dst, c, vec4f(ld(pres, c).x * p.pDecay, 0.0, 0.0, 1.0));
+}`,
+  jacobi: `${TEX(0, 'pres')} ${TEX(1, 'div')} ${OUT(2)}
+${HEAD}
+  let L = ld(pres, c - vec2i(1, 0)).x;
+  let R = ld(pres, c + vec2i(1, 0)).x;
+  let B = ld(pres, c - vec2i(0, 1)).x;
+  let T = ld(pres, c + vec2i(0, 1)).x;
+  textureStore(dst, c, vec4f((L + R + B + T - ld(div, c).x) * 0.25, 0.0, 0.0, 1.0));
+}`,
+  gradient: `${TEX(0, 'pres')} ${TEX(1, 'vel')} ${OUT(2)}
+${HEAD}
+  let L = ld(pres, c - vec2i(1, 0)).x;
+  let R = ld(pres, c + vec2i(1, 0)).x;
+  let B = ld(pres, c - vec2i(0, 1)).x;
+  let T = ld(pres, c + vec2i(0, 1)).x;
+  let v = ld(vel, c).xy - 0.5 * vec2f(R - L, T - B);
+  textureStore(dst, c, vec4f(v, 0.0, 1.0));
+}`,
+  advectVel: `${UNI(0)} ${TEX(1, 'src')} ${TEX(2, 'vel')}
+@group(0) @binding(3) var samp: sampler;
+${OUT(4)}
+${HEAD}
+  let back = uv - p.dt * textureSampleLevel(vel, samp, uv, 0.0).xy / p.simSize;
+  let v = textureSampleLevel(src, samp, back, 0.0).xy / (1.0 + p.velDiss * p.dt);
+  textureStore(dst, c, vec4f(v, 0.0, 1.0));
+}`,
+  advectDye: `${UNI(0)} ${TEX(1, 'src')} ${TEX(2, 'vel')}
+@group(0) @binding(3) var samp: sampler;
+${OUT(4)}
+${HEAD}
+  let back = uv - p.dt * textureSampleLevel(vel, samp, uv, 0.0).xy / p.simSize;
+  var col = textureSampleLevel(src, samp, back, 0.0).rgb / (1.0 + p.dyeDiss * p.dt);
+  // Half floats never quite reach zero under repeated division; clear the faint residue.
+  col = max(col - vec3f(0.02 * p.dt), vec3f(0.0));
+  textureStore(dst, c, vec4f(col, 1.0));
+}`,
+};
+
+const RENDER = /* wgsl */ `
+struct R { screen: vec2f, texel: vec2f, shading: f32, gloss: f32, pad: vec2f };
+@group(0) @binding(0) var dye: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<uniform> r: R;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+}
+fn dens(uv: vec2f) -> f32 { return length(textureSampleLevel(dye, samp, uv, 0.0).rgb); }
+@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let uv = pos.xy / r.screen;
+  var c = textureSampleLevel(dye, samp, uv, 0.0).rgb;
+  if (r.shading > 0.5) {
+    // Treat dye density as a height field: lambert shade + a soft specular sheen.
+    let t = r.texel;
+    let dx = dens(uv + vec2f(t.x, 0.0)) - dens(uv - vec2f(t.x, 0.0));
+    let dy = dens(uv + vec2f(0.0, t.y)) - dens(uv - vec2f(0.0, t.y));
+    let n = normalize(vec3f(dx, -dy, length(t) * 14.0));
+    let l = normalize(vec3f(-0.4, 0.6, 0.7));
+    let diffuse = clamp(dot(n, l) + 0.55, 0.55, 1.0);
+    let h = normalize(l + vec3f(0.0, 0.0, 1.0));
+    let spec = pow(max(dot(n, h), 0.0), 18.0) * r.gloss * min(dens(uv) * 2.0, 1.0);
+    c = c * diffuse + vec3f(spec);
+  }
+  c = 1.0 - exp(-c * 1.6);
+  let q = uv - 0.5;
+  let bg = mix(vec3f(0.012, 0.014, 0.035), vec3f(0.0), length(q) * 1.2);
+  // Dither to hide 8-bit banding in the dark gradients.
+  let n = fract(sin(dot(pos.xy, vec2f(12.9898, 78.233))) * 43758.5453) - 0.5;
+  return vec4f(bg + c * (1.0 - dot(q, q) * 0.6) + n / 255.0, 1.0);
+}`;
+
+async function main() {
+  if (!navigator.gpu) D.fail('이 데모는 WebGPU가 필요합니다.\n이 기기의 WebView는 WebGPU를 지원하지 않습니다.');
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) D.fail('WebGPU 어댑터를 찾을 수 없습니다.');
+  const device = await adapter.requestDevice();
+  device.lost.then((info) => {
+    if (info.reason !== 'destroyed') D.fail(`WebGPU 디바이스 손실: ${info.message}`);
+  });
+  const ctx = s.canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'opaque' });
+
+  device.pushErrorScope('validation');
+  const pipes = {};
+  for (const [name, body] of Object.entries(SHADERS)) {
+    const module = device.createShaderModule({ code: COMMON + body });
+    pipes[name] = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+  }
+  const renderModule = device.createShaderModule({ code: RENDER });
+  const renderPipe = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: renderModule, entryPoint: 'vs' },
+    fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+  const err = await device.popErrorScope();
+  if (err) D.fail(`WebGPU 셰이더 오류\n${err.message}`);
+
+  const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+  const params = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const splatBuf = device.createBuffer({ size: MAX_SPLATS * 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const renderBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  // ---- fields (recreated when the screen aspect changes) -------------------------------
+  const tex = (w, h) => device.createTexture({
+    size: [w, h], format: 'rgba16float',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  const pair = (w, h) => {
+    const t = [tex(w, h), tex(w, h)];
+    return { w, h, get read() { return t[0]; }, get write() { return t[1]; }, swap() { t.reverse(); }, destroy() { t.forEach((x) => x.destroy()); } };
+  };
+  const dims = (short) => {
+    const a = innerWidth / innerHeight;
+    return a < 1 ? [short, Math.round(short / a)] : [Math.round(short * a), short];
+  };
+  let F = null;
+  const createFields = () => {
+    if (F) Object.values(F).forEach((x) => x.destroy());
+    const [sw, sh] = dims(SIM_SHORT), [dw, dh] = dims(DYE_SHORT);
+    F = { vel: pair(sw, sh), pres: pair(sw, sh), dye: pair(dw, dh), div: pair(sw, sh), curl: pair(sw, sh) };
+    D.badge(`WebGPU compute · sim ${sw}×${sh} · dye ${dw}×${dh}`);
+  };
+  createFields();
+  let fieldKey = dims(SIM_SHORT).join('x');
+  s.onResize = () => {
+    const k = dims(SIM_SHORT).join('x');
+    if (k !== fieldKey) {
+      fieldKey = k;
+      createFields();
+    }
+  };
+
+  const run = (enc, name, resources, out) => {
+    const pipe = pipes[name];
+    const entries = resources.map((r, binding) => ({
+      binding,
+      resource: r instanceof GPUTexture ? r.createView() : r instanceof GPUSampler ? r : { buffer: r },
+    }));
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe);
+    pass.setBindGroup(0, device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries }));
+    pass.dispatchWorkgroups(Math.ceil(out.w / 8), Math.ceil(out.h / 8));
+    pass.end();
+  };
+
+  // ---- splats ------------------------------------------------------------------------
+  const PALETTES = {
+    '무지개': () => Math.random(),
+    '네온': () => 0.45 + Math.random() * 0.5,
+    '불꽃': () => Math.random() * 0.13,
+    '바다': () => 0.48 + Math.random() * 0.17,
+  };
+  const paletteNames = Object.keys(PALETTES);
+  let palette = paletteNames[0];
+  const hsv = (h, sat, v) => {
+    const f = (n) => {
+      const k = (n + h * 6) % 6;
+      return v - v * sat * Math.max(0, Math.min(k, 4 - k, 1));
+    };
+    return [f(5), f(3), f(1)];
+  };
+  const color = (gain = 0.3) => hsv(PALETTES[palette](), 1, 1).map((x) => x * gain);
+  const queue = [];
+  const splat = (x, y, fx, fy, rgb, radius = 0.0025) => {
+    if (queue.length < MAX_SPLATS) queue.push([x, y, fx, fy, ...rgb, radius]);
+  };
+  const burst = (n) => {
+    for (let i = 0; i < n; i++) {
+      splat(Math.random(), Math.random(), 1000 * (Math.random() - 0.5), 1000 * (Math.random() - 0.5), color(2.0), 0.0035);
+    }
+  };
+
+  // Touch: every pointer paints with its own colour; force follows the finger motion.
+  const fingers = new Map();
+  let lastTouch = -10;
+  s.canvas.addEventListener('pointerdown', (e) => {
+    fingers.set(e.pointerId, { x: e.clientX / innerWidth, y: e.clientY / innerHeight, rgb: color() });
+  });
+  s.canvas.addEventListener('pointermove', (e) => {
+    const f = fingers.get(e.pointerId);
+    if (!f) return;
+    const x = e.clientX / innerWidth, y = e.clientY / innerHeight;
+    // Finger motion converted to sim texels, amplified so a fast swipe makes a strong jet.
+    splat(x, y, (x - f.x) * F.vel.w * 30, (y - f.y) * F.vel.h * 30, f.rgb);
+    f.x = x;
+    f.y = y;
+  });
+  const lift = (e) => fingers.delete(e.pointerId);
+  s.canvas.addEventListener('pointerup', lift);
+  s.canvas.addEventListener('pointercancel', lift);
+  cam.onTap = (x, y) => {
+    lastTouch = now;
+    const a = Math.random() * Math.PI * 2;
+    splat(x, y, Math.cos(a) * 800, Math.sin(a) * 800, color(0.6), 0.004);
+  };
+
+  // ---- options -----------------------------------------------------------------------
+  let curlStrength = 15, shading = 1, dyeDiss = 0.5;
+  D.cycle(paletteNames, (i) => (palette = paletteNames[i]), 'color');
+  D.cycle(['소용돌이 보통', '소용돌이 강하게', '소용돌이 끄기'], (i) => (curlStrength = [15, 35, 0][i]), 'vortex');
+  D.cycle(['입체 셰이딩', '평면'], (i) => (shading = i ? 0 : 1), 'shading');
+  D.cycle(['잔상 보통', '잔상 길게'], (i) => (dyeDiss = [0.5, 0.15][i]), 'trails');
+  D.button('흩뿌리기', () => burst(8));
+  D.hint('드래그: 유체를 휘저어 보세요 · 여러 손가락 가능 · 탭: 물감 떨어뜨리기');
+
+  burst(10);
+
+  // ---- frame -------------------------------------------------------------------------
+  const pBuf = new ArrayBuffer(48), pF = new Float32Array(pBuf), pU = new Uint32Array(pBuf);
+  const splatData = new Float32Array(MAX_SPLATS * 8);
+  let now = 0, nextAuto = 2;
+  D.loop(s, (time, dt) => {
+    now = time;
+    if (fingers.size) lastTouch = time;
+    // Keep the canvas alive when nobody is touching it.
+    if (time - lastTouch > 3 && time > nextAuto) {
+      burst(1 + Math.floor(Math.random() * 3));
+      nextAuto = time + 0.6 + Math.random() * 1.2;
+    }
+
+    const step = Math.min(dt, 1 / 60);
+    const nSplats = queue.length;
+    pF.set([F.vel.w, F.vel.h, F.dye.w, F.dye.h, step, 0.2, dyeDiss, curlStrength, 0.8], 0);
+    pU[9] = nSplats;
+    pF[10] = innerWidth / innerHeight;
+    pF[11] = time;
+    device.queue.writeBuffer(params, 0, pBuf);
+    if (nSplats) {
+      splatData.fill(0);
+      queue.forEach((q, i) => splatData.set(q, i * 8));
+      device.queue.writeBuffer(splatBuf, 0, splatData);
+      queue.length = 0;
+    }
+
+    const enc = device.createCommandEncoder();
+    const { vel, pres, dye, div, curl } = F;
+    if (nSplats) {
+      run(enc, 'splatVel', [params, splatBuf, vel.read, vel.write], vel); vel.swap();
+      run(enc, 'splatDye', [params, splatBuf, dye.read, dye.write], dye); dye.swap();
+    }
+    run(enc, 'curl', [vel.read, curl.write], curl); curl.swap();
+    run(enc, 'vorticity', [params, vel.read, curl.read, vel.write], vel); vel.swap();
+    run(enc, 'divergence', [vel.read, div.write], div); div.swap();
+    run(enc, 'decay', [params, pres.read, pres.write], pres); pres.swap();
+    for (let i = 0; i < JACOBI; i++) {
+      run(enc, 'jacobi', [pres.read, div.read, pres.write], pres); pres.swap();
+    }
+    run(enc, 'gradient', [pres.read, vel.read, vel.write], vel); vel.swap();
+    run(enc, 'advectVel', [params, vel.read, vel.read, sampler, vel.write], vel); vel.swap();
+    run(enc, 'advectDye', [params, dye.read, vel.read, sampler, dye.write], dye); dye.swap();
+
+    device.queue.writeBuffer(renderBuf, 0, new Float32Array([s.width, s.height, 1 / dye.w, 1 / dye.h, shading, 0.25, 0, 0]));
+    const rp = enc.beginRenderPass({
+      colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+    });
+    rp.setPipeline(renderPipe);
+    rp.setBindGroup(0, device.createBindGroup({
+      layout: renderPipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: dye.read.createView() },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: { buffer: renderBuf } },
+      ],
+    }));
+    rp.draw(3);
+    rp.end();
+    device.queue.submit([enc.finish()]);
+  });
+}
+
+main().catch((e) => {
+  if (!D.failed) {
+    try { D.fail(`WebGPU 초기화 실패: ${e.message || e}`); } catch (_) { /* already shown */ }
+  }
+});
+</script>
+</body>
+</html>

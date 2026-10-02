@@ -80,4 +80,22 @@ val demos = listOf(
         accent = listOf(Color(0xFF9DFF00), Color(0xFF00D47E), Color(0xFF003B3B)),
         asset = "boids.html",
     ),
+    Demo(
+        id = "life-sim",
+        title = "3D Life Sim",
+        subtitle = "수십만 개 입자가 군집·필라멘트·격자를 이루는 인공생명 시뮬레이터 원작을 그대로 담았습니다. ☰ 메뉴에서 프리셋과 물리 값을 조절하세요. WebGPU 필요.",
+        inspiredBy = "3D Life Sim (MIT, kajukabla)",
+        tech = listOf("WebGPU", "WGSL compute", "200K particles"),
+        accent = listOf(Color(0xFFAADFD3), Color(0xFFF5D996), Color(0xFF0B2A26)),
+        asset = "life-sim/index.html",
+    ),
+    Demo(
+        id = "fluid",
+        title = "WebGPU Fluid",
+        subtitle = "Stable Fluids 유체 시뮬레이션을 컴퓨트 셰이더로 구현했습니다. 손가락으로 휘저으면 물감이 소용돌이칩니다(멀티터치). WebGPU 필요.",
+        inspiredBy = "WebGPU Fluid Simulation",
+        tech = listOf("WebGPU", "Navier–Stokes", "Vorticity"),
+        accent = listOf(Color(0xFFFF4FD8), Color(0xFF3AE0FF), Color(0xFF1B0B3A)),
+        asset = "fluid.html",
+    ),
 )

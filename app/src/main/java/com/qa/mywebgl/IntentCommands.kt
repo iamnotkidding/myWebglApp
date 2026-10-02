@@ -86,14 +86,16 @@ fun resolveDemos(spec: String?): List<Demo> {
     if (spec.isNullOrBlank() || spec.trim().equals("all", ignoreCase = true)) return demos
     return spec.split(',').map { it.trim() }.filter { it.isNotEmpty() }.map { key ->
         key.toIntOrNull()?.let { demos.getOrNull(it - 1) }
-            ?: demos.firstOrNull { d ->
-                d.id.equals(key, true) || d.asset.removeSuffix(".html").equals(key, true) || d.asset.equals(key, true)
-            }
+            ?: demos.firstOrNull { d -> d.id.equals(key, true) || d.shortName.equals(key, true) || d.asset.equals(key, true) }
             ?: throw IllegalArgumentException(
-                "unknown demo '$key' (use all, 1-${demos.size}, or one of ${demos.joinToString { it.asset.removeSuffix(".html") }})"
+                "unknown demo '$key' (use all, 1-${demos.size}, or one of ${demos.joinToString { it.shortName }})"
             )
     }
 }
+
+/** File-based name used on the command line: "sandstorm.html" → sandstorm, "life-sim/index.html" → life-sim. */
+val Demo.shortName: String
+    get() = asset.substringBefore('/').removeSuffix(".html")
 
 private fun Bundle.settingsPatch() = SettingsPatch(
     durationSec = text(IntentCommands.EXTRA_DURATION)?.let(::parseDuration),
