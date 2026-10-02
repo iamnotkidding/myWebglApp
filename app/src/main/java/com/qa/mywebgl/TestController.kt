@@ -13,8 +13,8 @@ import org.json.JSONObject
 import java.io.File
 import java.time.OffsetDateTime
 
-/** Log tag for test events; filter with `adb logcat -s myWebglTest`. */
-const val TEST_TAG = "myWebglTest"
+/** Logcat tag for every app log (test events and WebView console); `adb logcat -s SWQG.myWebglApp`. */
+const val LOG_TAG = "SWQG.myWebglApp"
 
 /** One demo being shown. [seq] is unique per run so the screen restarts even for a repeated demo. */
 data class Run(
@@ -58,7 +58,7 @@ class TestController(app: Application) : AndroidViewModel(app) {
     fun updateSettings(s: TestSettings) {
         settings = s
         store.save(s)
-        Log.i(TEST_TAG, "SETTINGS $s")
+        Log.i(LOG_TAG, "SETTINGS $s")
     }
 
     /** Opens a single demo from the gallery with the saved settings. */
@@ -70,14 +70,14 @@ class TestController(app: Application) : AndroidViewModel(app) {
         sessionParams = params
         index = 0
         loop = 1
-        Log.i(TEST_TAG, "SESSION_START demos=${list.joinToString(",") { it.id }} $s params='$params'")
+        Log.i(LOG_TAG, "SESSION_START demos=${list.joinToString(",") { it.id }} $s params='$params'")
         launch()
     }
 
     private fun launch() {
         val r = Run(++seq, queue[index], sessionSettings, sessionParams, index + 1, queue.size, loop)
         run = r
-        Log.i(TEST_TAG, "RUN_START ${r.demo.id} [${r.position}/${r.total} loop ${r.loop}] url=${r.url}")
+        Log.i(LOG_TAG, "RUN_START ${r.demo.id} [${r.position}/${r.total} loop ${r.loop}] url=${r.url}")
     }
 
     /** Called when a run ends on its own (timer or renderer loss) with the page's JSON report. */
@@ -91,7 +91,7 @@ class TestController(app: Application) : AndroidViewModel(app) {
                 loop++
                 index = 0
             } else {
-                Log.i(TEST_TAG, "SESSION_DONE")
+                Log.i(LOG_TAG, "SESSION_DONE")
                 run = null
                 queue = emptyList()
                 return
@@ -104,7 +104,7 @@ class TestController(app: Application) : AndroidViewModel(app) {
     fun stop(reason: String) {
         val current = run ?: return
         record(current, "stopped:$reason", null)
-        Log.i(TEST_TAG, "SESSION_STOPPED reason=$reason")
+        Log.i(LOG_TAG, "SESSION_STOPPED reason=$reason")
         run = null
         queue = emptyList()
     }
@@ -122,7 +122,7 @@ class TestController(app: Application) : AndroidViewModel(app) {
                 command.patch.isEmpty -> showSettings = true
                 else -> updateSettings(command.patch.applyTo(settings))
             }
-            is Command.Invalid -> Log.e(TEST_TAG, "INVALID ${command.message}")
+            is Command.Invalid -> Log.e(LOG_TAG, "INVALID ${command.message}")
         }
     }
 
@@ -139,10 +139,10 @@ class TestController(app: Application) : AndroidViewModel(app) {
             .put("params", r.params)
             .put("report", report?.let { runCatching { JSONObject(it) }.getOrNull() } ?: JSONObject.NULL)
             .toString()
-        Log.i(TEST_TAG, "RESULT $line")
+        Log.i(LOG_TAG, "RESULT $line")
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { resultsFile.appendText(line + "\n") }
-                .onFailure { Log.e(TEST_TAG, "could not write ${resultsFile.path}", it) }
+                .onFailure { Log.e(LOG_TAG, "could not write ${resultsFile.path}", it) }
         }
     }
 }

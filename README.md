@@ -93,11 +93,11 @@ adb shell am start -n $A/.MainActivity -a $A.action.SETTINGS                   #
 테스트 시간이 끝나면 각 데모의 프레임 통계(첫 1초 워밍업 제외)를 기록합니다.
 
 ```sh
-adb logcat -s myWebglTest                                              # 실시간 로그
+adb logcat -s SWQG.myWebglApp                                           # 실시간 로그
 adb shell cat /sdcard/Android/data/com.qa.mywebgl/files/results.jsonl  # 누적 결과 (JSON Lines)
 ```
 
-로그 이벤트: `SESSION_START`, `RUN_START`, `RESULT`, `SESSION_DONE`, `SESSION_STOPPED`, `SETTINGS`, `INVALID`
+로그 태그는 `SWQG.myWebglApp` 하나입니다. 이벤트: `SESSION_START`, `RUN_START`, `RESULT`, `SESSION_DONE`, `SESSION_STOPPED`, `SETTINGS`, `INVALID`, `RENDERER_GONE`, 그리고 WebView 콘솔 출력(`CONSOLE ...`)
 
 ```json
 {"time":"2026-10-03T07:30:40+09:00","demo":"giza-sandstorm","outcome":"finished","position":1,"total":2,"loop":1,

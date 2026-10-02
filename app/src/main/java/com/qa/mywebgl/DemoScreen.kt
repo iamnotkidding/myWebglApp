@@ -61,7 +61,6 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
-private const val TAG = "myWebgl"
 
 /**
  * Pages are served from this https host by [WebViewAssetLoader] rather than file://, because
@@ -250,14 +249,14 @@ private fun createDemoWebView(context: Context, onRendererGone: () -> Unit): Web
             // A renderer killed mid-demo (e.g. GPU memory pressure) would otherwise take the
             // whole app down; drop back to the gallery instead.
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
-                Log.w(TAG, "WebView renderer gone (crash=${detail.didCrash()})")
+                Log.w(LOG_TAG, "RENDERER_GONE WebView renderer gone (crash=${detail.didCrash()})")
                 onRendererGone()
                 return true
             }
         }
         webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(message: ConsoleMessage): Boolean {
-                Log.d(TAG, "${message.sourceId()}:${message.lineNumber()} ${message.message()}")
+                Log.d(LOG_TAG, "CONSOLE ${message.sourceId()}:${message.lineNumber()} ${message.message()}")
                 return true
             }
         }
