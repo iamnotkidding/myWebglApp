@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Neural Data Flow</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<script src="common.js"></script>
+<script>
+'use strict';
+// A tower of node rings linked by curved edges. Data packets with comet trails stream upward
+// along the edges; everything is additive and goes through a bloom pass. All motion is
+// evaluated in vertex shaders from time, so the CPU only uploads uniforms per frame.
+
+const s = D.surface({ scale: 1, minScale: 0.55, maxScale: 1 });
+const gl = D.webgl2(s);
+D.badge('WebGL2 · instanced packets · bloom');
+const bloom = new D.Bloom(gl, { levels: 6 });
+s.onResize = (w, h) => bloom.resize(w, h);
+s.onResize(s.width, s.height);
+
+// ---- procedural network -----------------------------------------------------
+const rand = D.rng(7);
+const LAYERS = 8, PER = 22, TRAIL = 12;
+const layerY = (i) => -4.2 + (i * 8.4) / (LAYERS - 1);
+const layerR = (i) => 1.4 + 2.2 * Math.sin((i / (LAYERS - 1)) * Math.PI * 0.95 + 0.15) ** 2;
+const nodes = [];
+for (let l = 0; l < LAYERS; l++) {
+  const twist = l * 0.35;
+  for (let k = 0; k < PER; k++) {
+    const a = (k / PER) * Math.PI * 2 + twist + (rand() - 0.5) * 0.12;
+    const r = layerR(l) * (0.85 + rand() * 0.3);
+    nodes.push({ l, k, a, p: [Math.cos(a) * r, layerY(l) + (rand() - 0.5) * 0.3, Math.sin(a) * r] });
+  }
+}
+const node = (l, k) => nodes[l * PER + (((k % PER) + PER) % PER)];
+
+const edges = [];
+for (let l = 0; l < LAYERS - 1; l++) {
+  for (let k = 0; k < PER; k++) {
+    const fan = new Set([0, 1 + Math.floor(rand() * 3), -1 - Math.floor(rand() * 3)]);
+    for (const off of fan) {
+      const a = node(l, k), b = node(l + 1, k + off);
+      const mid = D.vec3.scale(D.vec3.add(a.p, b.p), 0.5);
+      const radial = D.vec3.norm([mid[0], 0, mid[2]]);
+      const bulge = 0.6 + rand() * 1.2;
+      const c = [mid[0] + radial[0] * bulge, mid[1] + (rand() - 0.5) * 0.5, mid[2] + radial[2] * bulge];
+      edges.push({ p0: a.p, p1: c, p2: b.p, hue: rand() });
+    }
+  }
+}
+const bez = (e, t) => {
+  const u = 1 - t;
+  return [0, 1, 2].map((i) => u * u * e.p0[i] + 2 * u * t * e.p1[i] + t * t * e.p2[i]);
+};
+
+// ---- buffers ----------------------------------------------------------------
+function vao(layout, data, instanced = false) {
+  const v = gl.createVertexArray();
+  gl.bindVertexArray(v);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+  const stride = layout.reduce((a, b) => a + b, 0) * 4;
+  let off = 0;
+  layout.forEach((size, loc) => {
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, stride, off);
+    if (instanced) gl.vertexAttribDivisor(loc, 1);
+    off += size * 4;
+  });
+  gl.bindVertexArray(null);
+  return v;
+}
+
+// Edge lines: [pos3, t, hue]; plus a halo ring around every layer.
+const SEG = 18;
+const lineData = [];
+for (const e of edges) {
+  for (let i = 0; i < SEG; i++) {
+    const t0 = i / SEG, t1 = (i + 1) / SEG;
+    lineData.push(...bez(e, t0), t0, e.hue, ...bez(e, t1), t1, e.hue);
+  }
+}
+for (let l = 0; l < LAYERS; l++) {
+  const r = layerR(l) * 1.35, y = layerY(l), n = 96;
+  for (let i = 0; i < n; i++) {
+    const a0 = (i / n) * Math.PI * 2, a1 = ((i + 1) / n) * Math.PI * 2;
+    lineData.push(Math.cos(a0) * r, y, Math.sin(a0) * r, i / n, -1, Math.cos(a1) * r, y, Math.sin(a1) * r, (i + 1) / n, -1);
+  }
+}
+const lineVao = vao([3, 1, 1], lineData);
+const lineCount = lineData.length / 5;
+
+// Packets: per instance [p0, p1, p2, speed, offset, hue, size]; 2 packets per edge.
+const packetData = [];
+for (const e of edges) {
+  for (let j = 0; j < 2; j++) {
+    packetData.push(...e.p0, ...e.p1, ...e.p2, 0.12 + rand() * 0.25, rand(), rand() < 0.04 ? 1 : rand() * 0.96, 0.7 + rand() * 0.6);
+  }
+}
+const packetVao = vao([3, 3, 3, 1, 1, 1, 1], packetData, true);
+const packetCount = packetData.length / 13;
+
+// Sprites: nodes and drifting dust, [pos3, size, phase, drift].
+const spriteData = [];
+for (const n of nodes) spriteData.push(...n.p, 1.6, rand() * 100, 0);
+for (let i = 0; i < 2500; i++) {
+  const a = rand() * Math.PI * 2, r = Math.sqrt(rand()) * 9;
+  spriteData.push(Math.cos(a) * r, rand() * 14 - 7, Math.sin(a) * r, 0.25 + rand() * 0.4, rand() * 100, 0.1 + rand() * 0.35);
+}
+const spriteVao = vao([3, 1, 1, 1], spriteData);
+const spriteCount = spriteData.length / 6;
+
+// ---- shaders ----------------------------------------------------------------
+const PALETTE_GLSL = `
+uniform vec3 uPal[3];
+vec3 palette(float h) {
+  if (h < 0.0) return uPal[1] * 0.6;
+  if (h > 0.97) return vec3(1.6, 1.3, 1.6);
+  return h < 0.5 ? mix(uPal[0], uPal[1], h * 2.0) : mix(uPal[1], uPal[2], h * 2.0 - 1.0);
+}
+// Burst wave: a bright front that rises through the tower after a tap.
+uniform vec2 uBurst; // x = front height, y = intensity
+float burst(float y) { return uBurst.y * exp(-pow((y - uBurst.x) * 1.3, 2.0)); }
+`;
+
+const LINE_VS = `#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in float aT;
+layout(location = 2) in float aHue;
+uniform mat4 uVP;
+uniform float uTime;
+${PALETTE_GLSL}
+out vec3 vCol;
+void main() {
+  gl_Position = uVP * vec4(aPos, 1.0);
+  float flow = 0.5 + 0.5 * sin(aT * 18.0 - uTime * 5.0 + aHue * 40.0);
+  float a = aHue < 0.0 ? 0.12 : 0.05 + 0.08 * flow;
+  vCol = palette(aHue) * (a + burst(aPos.y) * 0.5);
+}`;
+const COLOR_FS = `#version 300 es
+precision highp float;
+in vec3 vCol;
+out vec4 o;
+void main() { o = vec4(vCol, 1.0); }`;
+
+const PACKET_VS = `#version 300 es
+layout(location = 0) in vec3 aP0;
+layout(location = 1) in vec3 aP1;
+layout(location = 2) in vec3 aP2;
+layout(location = 3) in float aSpeed;
+layout(location = 4) in float aOffset;
+layout(location = 5) in float aHue;
+layout(location = 6) in float aSize;
+uniform mat4 uVP;
+uniform float uTime;
+uniform float uScale;
+${PALETTE_GLSL}
+out vec3 vCol;
+void main() {
+  float k = float(gl_VertexID);                // 0 = head, larger = further back in the trail
+  float t = fract(uTime * aSpeed + aOffset) - k * 0.011;
+  if (t < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vCol = vec3(0.0); return; }
+  float u = 1.0 - t;
+  vec3 p = u * u * aP0 + 2.0 * u * t * aP1 + t * t * aP2;
+  vec4 clip = uVP * vec4(p, 1.0);
+  gl_Position = clip;
+  float tail = 1.0 - k / ${TRAIL}.0;
+  float b = burst(p.y);
+  gl_PointSize = max(1.0, aSize * (0.35 + 0.65 * tail) * (1.0 + b) * uScale / clip.w);
+  float fadeInOut = smoothstep(0.0, 0.08, t) * smoothstep(1.0, 0.9, t);
+  vCol = palette(aHue) * tail * tail * fadeInOut * (1.0 + b * 2.0);
+}`;
+const SPRITE_FS = `#version 300 es
+precision highp float;
+in vec3 vCol;
+out vec4 o;
+void main() {
+  vec2 q = gl_PointCoord * 2.0 - 1.0;
+  float d = dot(q, q);
+  if (d > 1.0) discard;
+  o = vec4(vCol * (exp(-d * 4.0) + exp(-d * 30.0)), 1.0);
+}`;
+
+const SPRITE_VS = `#version 300 es
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in float aSize;
+layout(location = 2) in float aPhase;
+layout(location = 3) in float aDrift;
+uniform mat4 uVP;
+uniform float uTime;
+uniform float uScale;
+${PALETTE_GLSL}
+out vec3 vCol;
+void main() {
+  vec3 p = aPos;
+  p.y = mod(p.y + uTime * aDrift + 7.0, 14.0) - 7.0;
+  vec4 clip = uVP * vec4(p, 1.0);
+  gl_Position = clip;
+  float b = burst(p.y);
+  bool isNode = aDrift == 0.0;
+  float flicker = isNode ? 0.35 + pow(0.5 + 0.5 * sin(uTime * 2.3 + aPhase), 12.0) * 1.6 : 0.12;
+  gl_PointSize = max(1.0, aSize * (1.0 + b * 0.8) * uScale / clip.w);
+  vCol = (isNode ? palette(fract(aPhase)) : uPal[0]) * (flicker + b * 1.5);
+}`;
+
+const lineProg = D.program(gl, LINE_VS, COLOR_FS);
+const packetProg = D.program(gl, PACKET_VS, SPRITE_FS);
+const spriteProg = D.program(gl, SPRITE_VS, SPRITE_FS);
+
+// ---- interaction ------------------------------------------------------------
+const PALETTES = {
+  '오로라': [[0.0, 1.0, 0.78], [0.0, 0.57, 1.0], [0.55, 0.3, 1.0]],
+  '인페르노': [[1.0, 0.75, 0.2], [1.0, 0.3, 0.15], [0.8, 0.1, 0.5]],
+  '매트릭스': [[0.6, 1.0, 0.3], [0.1, 0.9, 0.35], [0.0, 0.5, 0.3]],
+};
+const names = Object.keys(PALETTES);
+let pal = new Float32Array(PALETTES[names[0]].flat());
+let speed = 1, flowT = 0;
+let burstStart = -100;
+
+const cam = D.orbit(s.canvas, { dist: 13, pitch: 0.12, minDist: 5, maxDist: 25, autoRotate: 0.1 });
+cam.onTap = () => (burstStart = flowT);
+D.button('신호 버스트', () => (burstStart = flowT));
+D.cycle(names, (i) => (pal = new Float32Array(PALETTES[names[i]].flat())), 'palette');
+D.cycle(['속도 1×', '속도 2×', '속도 0.5×'], (i) => (speed = [1, 2, 0.5][i]), 'speed');
+D.hint('드래그: 회전 · 핀치: 확대 · 탭: 신호 버스트');
+D.stat(`${nodes.length} nodes · ${edges.length} links · ${packetCount * TRAIL} sprites`);
+
+D.loop(s, (time, dt) => {
+  cam.update(dt);
+  flowT += dt * speed;
+  const age = flowT - burstStart;
+  const burstU = [-5 + age * 5, Math.max(0, 1 - age / 2.4) * 1.6];
+  const common = { uVP: cam.viewProj(s.aspect), uTime: flowT, uPal: pal, uBurst: burstU, uScale: s.height * 0.05 };
+
+  bloom.begin();
+  gl.clearColor(0.004, 0.006, 0.018, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);
+
+  lineProg.use().set(common);
+  gl.bindVertexArray(lineVao);
+  gl.drawArrays(gl.LINES, 0, lineCount);
+
+  spriteProg.use().set(common);
+  gl.bindVertexArray(spriteVao);
+  gl.drawArrays(gl.POINTS, 0, spriteCount);
+
+  packetProg.use().set(common);
+  gl.bindVertexArray(packetVao);
+  gl.drawArraysInstanced(gl.POINTS, 0, TRAIL, packetCount);
+
+  bloom.end({ strength: 1.1, exposure: 1.3, vignette: 0.5, time });
+});
+</script>
+</body>
+</html>

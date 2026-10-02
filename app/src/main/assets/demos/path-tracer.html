@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Progressive Path Tracer</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<script src="common.js"></script>
+<script>
+'use strict';
+// Monte Carlo path tracer for a small furnished room: analytic spheres and rotated boxes,
+// a ceiling area light sampled directly (next-event estimation), and diffuse / rough metal /
+// glass materials. One sample per pixel per frame is summed into a float texture, so the
+// image converges while the camera is still and restarts when anything changes.
+
+const dpr = Math.min(window.devicePixelRatio || 1, 2);
+const scale = Math.min(0.6, Math.sqrt(380000 / (innerWidth * dpr * innerHeight * dpr)));
+const s = D.surface({ scale, maxDpr: 2 });
+const gl = D.webgl2(s);
+D.requireFloatRT(gl);
+D.badge('WebGL2 · path tracing · NEE');
+
+const TRACE_FS = `#version 300 es
+precision highp float;
+precision highp int;
+in vec2 vUv;
+layout(location = 0) out vec4 o;
+uniform highp sampler2D uPrev;
+uniform vec2 uRes;
+uniform int uFrame;
+uniform vec3 uEye, uRight, uUp, uFwd;
+uniform int uMainMat;     // 0 glass, 1 mirror, 2 matte, 3 rough gold
+uniform vec3 uLightCol;
+uniform float uLampOn;
+uniform float uFocal;
+${D.GLSL_NOISE}
+
+const float PI = 3.14159265;
+const vec3 ROOM_MIN = vec3(-3.0, 0.0, -3.0);
+const vec3 ROOM_MAX = vec3(3.0, 3.6, 3.0);
+const vec2 LIGHT_HALF = vec2(0.9, 0.9);
+
+uint seed;
+uint pcg(uint v) {
+  uint state = v * 747796405u + 2891336453u;
+  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+float rnd() { seed = pcg(seed); return float(seed) / 4294967296.0; }
+vec3 randUnit() {
+  float z = rnd() * 2.0 - 1.0, a = rnd() * 2.0 * PI, r = sqrt(1.0 - z * z);
+  return vec3(r * cos(a), r * sin(a), z);
+}
+
+struct Hit { float t; vec3 n; vec3 albedo; vec3 emit; int type; float rough; bool light; };
+// type: 0 diffuse, 1 metal, 2 glass
+
+bool sphere(vec3 ro, vec3 rd, vec3 c, float r, inout float t, out vec3 n) {
+  vec3 oc = ro - c;
+  float b = dot(oc, rd), h = b * b - dot(oc, oc) + r * r;
+  if (h < 0.0) return false;
+  h = sqrt(h);
+  float t0 = -b - h;
+  if (t0 < 1e-3) t0 = -b + h;
+  if (t0 < 1e-3 || t0 > t) return false;
+  t = t0;
+  n = (ro + rd * t0 - c) / r;
+  return true;
+}
+
+bool box(vec3 ro, vec3 rd, vec3 c, vec3 hs, float ang, inout float t, out vec3 n) {
+  float cs = cos(ang), sn = sin(ang);
+  mat2 R = mat2(cs, sn, -sn, cs);       // world → box rotation about y
+  vec3 lo = ro - c;
+  lo.xz = R * lo.xz;
+  vec3 ld = rd;
+  ld.xz = R * ld.xz;
+  vec3 inv = 1.0 / ld;
+  vec3 t1 = (-hs - lo) * inv, t2 = (hs - lo) * inv;
+  vec3 tmin = min(t1, t2), tmax = max(t1, t2);
+  float tn = max(max(tmin.x, tmin.y), tmin.z);
+  float tf = min(min(tmax.x, tmax.y), tmax.z);
+  if (tn > tf || tf < 1e-3) return false;
+  float th = tn > 1e-3 ? tn : tf;
+  if (th > t) return false;
+  t = th;
+  vec3 ln = th == tmin.x || th == tmax.x ? vec3(sign(lo.x + ld.x * th), 0.0, 0.0)
+          : th == tmin.y || th == tmax.y ? vec3(0.0, sign(lo.y + ld.y * th), 0.0)
+          : vec3(0.0, 0.0, sign(lo.z + ld.z * th));
+  ln.xz = transpose(R) * ln.xz;
+  n = ln;
+  return true;
+}
+
+void mainMaterial(inout Hit h) {
+  if (uMainMat == 0) { h.type = 2; h.albedo = vec3(1.0); }
+  else if (uMainMat == 1) { h.type = 1; h.albedo = vec3(0.95); h.rough = 0.0; }
+  else if (uMainMat == 2) { h.type = 0; h.albedo = vec3(0.75, 0.12, 0.1); }
+  else { h.type = 1; h.albedo = vec3(1.0, 0.75, 0.35); h.rough = 0.35; }
+}
+
+Hit trace(vec3 ro, vec3 rd) {
+  Hit h;
+  h.emit = vec3(0.0); h.type = 0; h.rough = 0.0; h.light = false;
+
+  // Room (we are always inside): nearest exit plane.
+  vec3 tA = (ROOM_MIN - ro) / rd, tB = (ROOM_MAX - ro) / rd;
+  vec3 tx = max(tA, tB);
+  h.t = min(min(tx.x, tx.y), tx.z);
+  vec3 p = ro + rd * h.t;
+  if (h.t == tx.x) {
+    h.n = vec3(-sign(rd.x), 0.0, 0.0);
+    h.albedo = rd.x < 0.0 ? vec3(0.72, 0.32, 0.2) : vec3(0.3, 0.52, 0.48);
+  } else if (h.t == tx.y) {
+    h.n = vec3(0.0, -sign(rd.y), 0.0);
+    if (rd.y > 0.0) {
+      h.albedo = vec3(0.85);
+      if (abs(p.x) < LIGHT_HALF.x && abs(p.z) < LIGHT_HALF.y) { h.emit = uLightCol; h.light = true; }
+    } else {
+      float plank = floor(p.z * 2.5);
+      float g = hash12(vec2(plank, 7.0));
+      float grain = 0.88 + 0.12 * sin(p.x * 18.0 + noise2(vec2(p.x * 2.0, plank)) * 6.0);
+      h.albedo = mix(vec3(0.45, 0.28, 0.16), vec3(0.62, 0.42, 0.25), g) * grain;
+      h.albedo *= smoothstep(0.0, 0.02, fract(p.z * 2.5)) * 0.25 + 0.75;
+    }
+  } else {
+    h.n = vec3(0.0, 0.0, -sign(rd.z));
+    h.albedo = vec3(0.8, 0.78, 0.74);
+    // A dark picture frame on the back wall.
+    if (rd.z < 0.0 && abs(p.x + 0.4) < 1.1 && abs(p.y - 2.0) < 0.7) {
+      bool inner = abs(p.x + 0.4) < 1.0 && abs(p.y - 2.0) < 0.6;
+      h.albedo = inner ? mix(vec3(0.1, 0.2, 0.45), vec3(0.9, 0.55, 0.2), smoothstep(1.4, 2.6, p.y + 0.3 * sin(p.x * 3.0))) : vec3(0.08);
+    }
+  }
+
+  vec3 n;
+  if (sphere(ro, rd, vec3(-0.9, 0.7, -0.5), 0.7, h.t, n)) { h.n = n; h.emit = vec3(0.0); h.light = false; h.rough = 0.0; mainMaterial(h); }
+  if (sphere(ro, rd, vec3(1.05, 0.4, 0.95), 0.4, h.t, n)) { h.n = n; h.emit = vec3(0.0); h.light = false; h.type = 1; h.albedo = vec3(0.95, 0.95, 1.0); h.rough = 0.08; }
+  if (sphere(ro, rd, vec3(-2.2, 0.85, 1.55), 0.25, h.t, n)) {
+    h.n = n; h.light = false; h.type = 0; h.rough = 0.0;
+    h.albedo = vec3(0.9);
+    h.emit = uLampOn * vec3(9.0, 5.0, 2.2);
+  }
+  if (box(ro, rd, vec3(1.35, 0.95, -1.5), vec3(0.42, 0.95, 0.42), 0.45, h.t, n)) { h.n = n; h.emit = vec3(0.0); h.light = false; h.type = 0; h.albedo = vec3(0.82); }
+  if (box(ro, rd, vec3(-2.2, 0.3, 1.55), vec3(0.45, 0.3, 0.45), -0.3, h.t, n)) { h.n = n; h.emit = vec3(0.0); h.light = false; h.type = 0; h.albedo = vec3(0.25, 0.32, 0.55); }
+  return h;
+}
+
+vec3 radiance(vec3 ro, vec3 rd) {
+  vec3 acc = vec3(0.0), thr = vec3(1.0);
+  bool specular = true;
+  for (int bounce = 0; bounce < 6; bounce++) {
+    Hit h = trace(ro, rd);
+    vec3 p = ro + rd * h.t;
+    // The ceiling light is sampled explicitly at diffuse hits, so only count it when reached
+    // directly or through a mirror/glass bounce; other emitters always count.
+    if (h.light) { if (specular) acc += thr * h.emit; break; }
+    acc += thr * h.emit;
+
+    if (h.type == 0) {
+      vec3 n = faceforward(h.n, rd, h.n);
+      // Next-event estimation towards a random point on the ceiling light.
+      vec3 lp = vec3((rnd() * 2.0 - 1.0) * LIGHT_HALF.x, ROOM_MAX.y, (rnd() * 2.0 - 1.0) * LIGHT_HALF.y);
+      vec3 ld = lp - p;
+      float dist = length(ld);
+      ld /= dist;
+      float cosS = dot(n, ld), cosL = ld.y;
+      if (cosS > 0.0 && cosL > 0.0) {
+        Hit sh = trace(p + n * 1e-3, ld);
+        if (sh.light) {
+          float area = 4.0 * LIGHT_HALF.x * LIGHT_HALF.y;
+          acc += thr * h.albedo / PI * uLightCol * cosS * cosL * area / (dist * dist);
+        }
+      }
+      thr *= h.albedo;
+      rd = normalize(n + randUnit());
+      ro = p + n * 1e-3;
+      specular = false;
+    } else if (h.type == 1) {
+      vec3 n = faceforward(h.n, rd, h.n);
+      rd = normalize(reflect(rd, n) + randUnit() * h.rough);
+      if (dot(rd, n) <= 0.0) break;
+      thr *= h.albedo;
+      ro = p + n * 1e-3;
+      specular = h.rough < 0.2;
+    } else {
+      bool entering = dot(rd, h.n) < 0.0;
+      vec3 n = entering ? h.n : -h.n;
+      float eta = entering ? 1.0 / 1.5 : 1.5;
+      float cosI = min(dot(-rd, n), 1.0);
+      float r0 = (1.0 - 1.5) / (1.0 + 1.5);
+      r0 *= r0;
+      float fres = r0 + (1.0 - r0) * pow(1.0 - cosI, 5.0);
+      vec3 refr = refract(rd, n, eta);
+      if (dot(refr, refr) == 0.0 || rnd() < fres) {
+        rd = reflect(rd, n);
+        ro = p + n * 1e-3;
+      } else {
+        rd = refr;
+        ro = p - n * 1e-3;
+        thr *= entering ? vec3(1.0) : vec3(0.92, 0.97, 0.95);
+      }
+      specular = true;
+    }
+
+    // Russian roulette after a few bounces keeps long paths cheap but unbiased.
+    if (bounce >= 2) {
+      float q = clamp(max(thr.r, max(thr.g, thr.b)), 0.05, 0.95);
+      if (rnd() > q) break;
+      thr /= q;
+    }
+  }
+  return acc;
+}
+
+void main() {
+  seed = pcg(uint(gl_FragCoord.x) + pcg(uint(gl_FragCoord.y) + pcg(uint(uFrame) * 7919u)));
+  vec2 jitter = vec2(rnd(), rnd()) - 0.5;
+  vec2 uv = (gl_FragCoord.xy + jitter - 0.5 * uRes) / min(uRes.x, uRes.y);
+  vec3 rd = normalize(uFwd * uFocal + uRight * uv.x + uUp * uv.y);
+  vec3 c = radiance(uEye, rd);
+  c = min(c, vec3(20.0)); // clamp rare fireflies
+  vec4 prev = uFrame == 0 ? vec4(0.0) : texelFetch(uPrev, ivec2(gl_FragCoord.xy), 0);
+  o = prev + vec4(c, 1.0);
+}`;
+
+const SHOW_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 o;
+uniform highp sampler2D uAcc;
+vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+void main() {
+  vec4 a = texelFetch(uAcc, ivec2(vUv * vec2(textureSize(uAcc, 0))), 0);
+  vec3 c = a.rgb / max(a.a, 1.0);
+  c = pow(aces(c * 0.9), vec3(1.0 / 2.2));
+  o = vec4(c, 1.0);
+}`;
+
+const trace = D.program(gl, D.FS_VS, TRACE_FS);
+const show = D.program(gl, D.FS_VS, SHOW_FS);
+
+let acc = [];
+let frame = 0;
+s.onResize = (w, h) => {
+  acc.forEach((a) => a.free());
+  acc = [0, 1].map(() => D.target(gl, w, h, { internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT, filter: gl.NEAREST }));
+  frame = 0;
+};
+s.onResize(s.width, s.height);
+
+const cam = D.orbit(s.canvas, {
+  // The eye must stay inside the 6 × 6 m room; these limits keep it clear of the walls.
+  dist: 3.3, pitch: 0.12, yaw: 0.2, target: [0, 1.2, -0.8],
+  minDist: 1.2, maxDist: 3.5, minYaw: -0.55, maxYaw: 0.55, minPitch: -0.25, maxPitch: 0.5, autoRotate: 0,
+});
+const restart = () => (frame = 0);
+
+let mainMat = 0, lightCol = [9, 8, 6.5], lampOn = 0;
+D.cycle(['유리', '거울', '무광', '골드'], (i) => { mainMat = i; restart(); }, 'material');
+D.cycle(['따뜻한 조명', '차가운 조명', '무드 조명'], (i) => {
+  lightCol = [[9, 8, 6.5], [6, 7.5, 10], [1.2, 1.0, 0.9]][i];
+  lampOn = i === 2 ? 1 : 0;
+  restart();
+}, 'lighting');
+D.hint('드래그: 시점 이동 · 핀치: 확대 · 멈춰 있으면 노이즈가 점점 사라집니다');
+
+D.loop(s, (time, dt) => {
+  cam.update(dt);
+  if (cam.changed) restart();
+  const b = cam.basis();
+  const src = acc[frame % 2], dst = acc[(frame + 1) % 2];
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+  gl.viewport(0, 0, s.width, s.height);
+  D.bindTextures(gl, [src.tex]);
+  trace.use().set({
+    uPrev: 0, uRes: [s.width, s.height], uFrame: frame,
+    uEye: b.eye, uRight: b.right, uUp: b.up, uFwd: b.forward,
+    uMainMat: mainMat, uLightCol: lightCol, uLampOn: lampOn, uFocal: s.aspect < 1 ? 0.95 : 1.1,
+  });
+  D.drawFullscreen(gl);
+  frame++;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  D.bindTextures(gl, [dst.tex]);
+  show.use().set({ uAcc: 0 });
+  D.drawFullscreen(gl);
+  D.stat(`${frame} spp`);
+});
+</script>
+</body>
+</html>

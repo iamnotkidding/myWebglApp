@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Shadow Play</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<script src="common.js"></script>
+<script>
+'use strict';
+// A dark gallery lit by a single point light you drag around: a colonnade with arches, a
+// perforated screen that throws dappled light, and a slowly turning sculpture. Almost all of
+// the image is shadow — penumbra width comes from the soft-shadow march.
+
+const s = D.surface({ scale: 0.55, minScale: 0.3, maxScale: 0.8 });
+const gl = D.webgl2(s);
+D.badge('WebGL2 · SDF soft shadows · AO');
+
+const FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 o;
+uniform vec2 uRes;
+uniform float uTime;
+uniform vec3 uEye, uRight, uUp, uFwd;
+uniform vec3 uLight;
+uniform vec3 uLightCol;
+uniform float uSoft;
+${D.GLSL_NOISE}
+
+float sdBox(vec3 p, vec3 b) { vec3 q = abs(p) - b; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }
+float sdTorus(vec3 p, vec2 t) { vec2 q = vec2(length(p.xz) - t.x, p.y); return length(q) - t.y; }
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+
+// Material ids: 0 plaster (walls/floor), 1 stone (columns/arches), 2 brass (sculpture), 3 screen.
+float map(vec3 p, out float m) {
+  float floorD = p.y;
+  float wall = p.z + 4.0;
+  float d = min(floorD, wall);
+  m = 0.0;
+
+  // Colonnade: five columns repeated along x, with an arched beam on top.
+  float sp = 1.7;
+  float id = clamp(floor(p.x / sp + 0.5), -2.0, 2.0);
+  vec3 q = p - vec3(id * sp, 0.0, -1.6);
+  float col = max(length(q.xz) - 0.2, q.y - 2.6);
+  col = min(col, sdBox(q - vec3(0.0, 0.1, 0.0), vec3(0.3, 0.1, 0.3)));
+  col = min(col, sdBox(q - vec3(0.0, 2.6, 0.0), vec3(0.3, 0.08, 0.3)));
+  float beam = sdBox(p - vec3(0.0, 3.15, -1.6), vec3(4.0, 0.5, 0.3));
+  float aid = clamp(floor(p.x / sp), -2.0, 1.0) + 0.5;
+  vec3 a = p - vec3(aid * sp, 2.65, -1.6);
+  beam = max(beam, -(length(a.xy) - 0.66));
+  float stone = min(col, beam);
+  if (stone < d) { d = stone; m = 1.0; }
+
+  // Perforated screen: thin slab minus a grid of round holes.
+  vec3 sp3 = p - vec3(1.9, 1.35, 1.1);
+  sp3.xz *= rot(-0.5);
+  float slab = sdBox(sp3, vec3(1.05, 1.35, 0.03));
+  vec2 cell = mod(sp3.xy + 0.13, 0.26) - 0.13;
+  float holes = length(cell) - 0.085;
+  float screen = max(slab, -holes);
+  if (screen < d) { d = screen; m = 3.0; }
+
+  // Sculpture: two interlocked, slowly turning tori on a plinth.
+  vec3 k = p - vec3(-1.7, 1.25, 1.0);
+  k.xz *= rot(uTime * 0.35);
+  k.xy *= rot(0.6);
+  float sc = sdTorus(k, vec2(0.55, 0.09));
+  vec3 k2 = k;
+  k2.yz *= rot(1.5708);
+  k2.x -= 0.55;
+  sc = min(sc, sdTorus(k2, vec2(0.55, 0.09)));
+  float plinth = sdBox(p - vec3(-1.7, 0.3, 1.0), vec3(0.35, 0.3, 0.35));
+  if (sc < d) { d = sc; m = 2.0; }
+  if (plinth < d) { d = plinth; m = 1.0; }
+
+  // A sphere resting on the floor.
+  float ball = length(p - vec3(0.2, 0.5, 2.1)) - 0.5;
+  if (ball < d) { d = ball; m = 1.0; }
+  return d;
+}
+float map(vec3 p) { float m; return map(p, m); }
+
+vec3 normalAt(vec3 p) {
+  vec2 e = vec2(0.0015, -0.0015);
+  return normalize(e.xyy * map(p + e.xyy) + e.yyx * map(p + e.yyx) + e.yxy * map(p + e.yxy) + e.xxx * map(p + e.xxx));
+}
+
+float shadow(vec3 ro, vec3 rd, float maxT) {
+  float res = 1.0, t = 0.04, ph = 1e10;
+  for (int i = 0; i < 48; i++) {
+    float h = map(ro + rd * t);
+    float y = h * h / (2.0 * ph);
+    float d = sqrt(max(h * h - y * y, 0.0));
+    res = min(res, uSoft * d / max(0.0, t - y));
+    ph = h;
+    t += clamp(h, 0.01, 0.4);
+    if (res < 0.002 || t > maxT) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+float ao(vec3 p, vec3 n) {
+  float occ = 0.0, w = 1.0;
+  for (int i = 1; i <= 5; i++) {
+    float h = 0.03 + 0.12 * float(i);
+    occ += (h - map(p + n * h)) * w;
+    w *= 0.7;
+  }
+  return clamp(1.0 - 2.2 * occ, 0.0, 1.0);
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / min(uRes.x, uRes.y);
+  vec3 rd = normalize(uFwd * 1.4 + uRight * uv.x + uUp * uv.y);
+  vec3 ro = uEye;
+
+  float t = 0.0, m = 0.0;
+  bool hit = false;
+  for (int i = 0; i < 100; i++) {
+    float d = map(ro + rd * t, m);
+    if (d < 0.0008 * t) { hit = true; break; }
+    t += d;
+    if (t > 30.0) break;
+  }
+
+  vec3 col = vec3(0.0);
+  if (hit) {
+    vec3 p = ro + rd * t;
+    vec3 n = normalAt(p);
+    vec3 albedo = vec3(0.82, 0.77, 0.68);
+    float spec = 0.0, shine = 8.0;
+    if (m < 0.5) {
+      albedo *= 0.85 + 0.15 * noise2(p.xy * 6.0 + p.z * 6.0);
+    } else if (m < 1.5) {
+      albedo = vec3(0.75, 0.7, 0.62) * (0.8 + 0.2 * noise3(p * 9.0));
+      spec = 0.08;
+    } else if (m < 2.5) {
+      albedo = vec3(0.85, 0.6, 0.3);
+      spec = 0.9; shine = 48.0;
+    } else {
+      albedo = vec3(0.35, 0.3, 0.27);
+    }
+    vec3 L = uLight - p;
+    float dist = length(L);
+    L /= dist;
+    float dif = max(dot(n, L), 0.0);
+    float sh = dif > 0.0 ? shadow(p + n * 0.03, L, dist) : 0.0;
+    float att = 6.5 / (1.0 + dist * dist * 0.9);
+    float occ = ao(p, n);
+    vec3 h = normalize(L - rd);
+    float sp = pow(max(dot(n, h), 0.0), shine) * spec;
+    col = albedo * uLightCol * dif * sh * att + uLightCol * sp * sh * att;
+    // A whisper of bounce light so the darkness has depth instead of being flat black.
+    col += albedo * vec3(0.012, 0.014, 0.02) * occ * (0.6 + 0.4 * n.y);
+    col *= mix(0.6, 1.0, occ);
+  }
+
+  // Glow of the bulb itself, occluded by geometry in front of it.
+  vec3 toL = uLight - ro;
+  float tl = dot(toL, rd);
+  if (tl > 0.0 && (!hit || tl < t)) {
+    float dl = length(toL - rd * tl);
+    col += uLightCol * (exp(-dl * 22.0) * 2.0 + exp(-dl * 4.0) * 0.08);
+  }
+
+  col = 1.0 - exp(-col * 1.6);
+  col = pow(col, vec3(0.4545));
+  vec2 q = vUv - 0.5;
+  col *= 1.0 - dot(q, q) * 1.1;
+  col += (hash12(gl_FragCoord.xy + fract(uTime) * 311.0) - 0.5) * 0.035;
+  o = vec4(col, 1.0);
+}`;
+
+const prog = D.program(gl, D.FS_VS, FS);
+const cam = D.orbit(s.canvas, {
+  dist: s.aspect < 1 ? 8.5 : 7.5, pitch: 0.34, target: [0, 1.1, 0],
+  minDist: 4, maxDist: 14, rotate: false, autoRotate: 0,
+});
+
+const COLORS = [
+  { name: '촛불', c: [1.0, 0.72, 0.42] },
+  { name: '달빛', c: [0.62, 0.75, 1.0] },
+  { name: '네온', c: [1.0, 0.3, 0.55] },
+  { name: '백색', c: [1.0, 1.0, 1.0] },
+];
+let lightCol = COLORS[0].c;
+let soft = 10;
+D.cycle(COLORS.map((x) => x.name), (i) => (lightCol = COLORS[i].c), 'light');
+D.cycle(['그림자 보통', '그림자 선명', '그림자 흐림'], (i) => (soft = [10, 32, 3][i]), 'shadow');
+D.hint('드래그: 광원 이동 · 핀치: 확대 · 손을 떼면 광원이 스스로 떠돕니다');
+
+let light = [0, 2.2, 3];
+let manualUntil = 0;
+D.loop(s, (time, dt) => {
+  cam.update(dt);
+  cam.yaw = 0.35 * Math.sin(time * 0.07);
+
+  let target;
+  if (cam.pointer.down) manualUntil = time + 3;
+  if (time < manualUntil) {
+    target = [(cam.pointer.x - 0.5) * 8, 0.4 + (1 - cam.pointer.y) * 3.6, 3.0];
+  } else {
+    target = [3.2 * Math.sin(time * 0.33), 2.0 + 1.1 * Math.sin(time * 0.21), 2.6 + 0.8 * Math.cos(time * 0.17)];
+  }
+  const k = Math.min(1, dt * 6);
+  light = light.map((v, i) => v + (target[i] - v) * k);
+
+  const b = cam.basis();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, s.width, s.height);
+  prog.use().set({
+    uRes: [s.width, s.height], uTime: time,
+    uEye: b.eye, uRight: b.right, uUp: b.up, uFwd: b.forward,
+    uLight: light, uLightCol: lightCol, uSoft: soft,
+  });
+  D.drawFullscreen(gl);
+});
+</script>
+</body>
+</html>

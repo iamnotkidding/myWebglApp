@@ -1,0 +1,83 @@
+package com.qa.mywebgl
+
+import androidx.compose.ui.graphics.Color
+
+/**
+ * One bundled demo. [asset] is a page under `assets/demos/`; [inspiredBy] names the
+ * webgpu.com showcase entry whose idea the demo reimplements.
+ */
+data class Demo(
+    val id: String,
+    val title: String,
+    val subtitle: String,
+    val inspiredBy: String,
+    val tech: List<String>,
+    val accent: List<Color>,
+    val asset: String,
+)
+
+val demos = listOf(
+    Demo(
+        id = "particle-life",
+        title = "Particle Life 3D",
+        subtitle = "4,096개 입자가 6종의 끌림·밀어냄 규칙으로 생명체처럼 군집합니다. 화면을 두 번 탭하면 새 규칙이 생성됩니다.",
+        inspiredBy = "3D Life Sim",
+        tech = listOf("GPGPU", "Float Texture", "N-body"),
+        accent = listOf(Color(0xFFFF4FD8), Color(0xFF7B5CFF), Color(0xFF00E5FF)),
+        asset = "particle-life.html",
+    ),
+    Demo(
+        id = "giza-sandstorm",
+        title = "Giza Sandstorm",
+        subtitle = "레이마칭으로 그린 피라미드와 사구 위로 모래폭풍이 몰아칩니다. 드래그로 시점을 돌려 보세요.",
+        inspiredBy = "Ancient Egypt in 3D",
+        tech = listOf("Raymarching", "SDF", "Volumetric fog"),
+        accent = listOf(Color(0xFFFFB347), Color(0xFFE0703A), Color(0xFF6B3A1F)),
+        asset = "sandstorm.html",
+    ),
+    Demo(
+        id = "data-flow",
+        title = "Neural Data Flow",
+        subtitle = "AI 인프라를 흐르는 데이터 펄스를 시네마틱하게 시각화했습니다. 탭하면 신호 버스트가 퍼집니다.",
+        inspiredBy = "Edolus",
+        tech = listOf("Custom GLSL", "Additive blending", "Bloom"),
+        accent = listOf(Color(0xFF00FFC6), Color(0xFF0091FF), Color(0xFF2A1B6B)),
+        asset = "data-flow.html",
+    ),
+    Demo(
+        id = "wireframe-station",
+        title = "Wireframe Station",
+        subtitle = "다층 지하 역사를 겹겹이 쌓인 와이어프레임 지도로 재구성하고 승객 흐름을 빛으로 표시합니다.",
+        inspiredBy = "Shinjuku Station Indoor",
+        tech = listOf("Line rendering", "Depth fade", "Orbit camera"),
+        accent = listOf(Color(0xFF7CFF6B), Color(0xFF00C2FF), Color(0xFF0B1A3A)),
+        asset = "wireframe-station.html",
+    ),
+    Demo(
+        id = "shadow-play",
+        title = "Shadow Play",
+        subtitle = "빛 대신 그림자가 주인공인 장면. 움직이는 광원이 만드는 소프트 섀도를 손가락으로 조종합니다.",
+        inspiredBy = "Artisans d'Idées",
+        tech = listOf("Soft shadows", "Ambient occlusion", "SDF"),
+        accent = listOf(Color(0xFFF2E8D5), Color(0xFF8A7B66), Color(0xFF1A1611)),
+        asset = "shadow-play.html",
+    ),
+    Demo(
+        id = "path-tracer",
+        title = "Progressive Path Tracer",
+        subtitle = "실내 공간을 몬테카를로 경로 추적으로 점진적으로 렌더링합니다. 재질을 바꾸며 수렴 과정을 지켜보세요.",
+        inspiredBy = "Giuseppe Paccione 3D Portfolio",
+        tech = listOf("Path tracing", "Accumulation", "PBR"),
+        accent = listOf(Color(0xFFFFE08A), Color(0xFFFF6B6B), Color(0xFF3B2A5C)),
+        asset = "path-tracer.html",
+    ),
+    Demo(
+        id = "webgpu-boids",
+        title = "WebGPU Compute Boids",
+        subtitle = "WebGPU 컴퓨트 셰이더로 4,096마리 새 떼를 3D로 시뮬레이션합니다. 미지원 기기에서는 WebGL2로 자동 대체됩니다.",
+        inspiredBy = "WebGPU Samples",
+        tech = listOf("WebGPU", "WGSL compute", "Instancing"),
+        accent = listOf(Color(0xFF9DFF00), Color(0xFF00D47E), Color(0xFF003B3B)),
+        asset = "boids.html",
+    ),
+)

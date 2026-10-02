@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Particle Life 3D</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<script src="common.js"></script>
+<script>
+'use strict';
+// Particle Life: every particle has one of TYPES species; species A is attracted to / repelled by
+// species B according to an asymmetric matrix. The O(N²) force pass runs in a fragment shader
+// that reads and writes position/velocity float textures (ping-pong, two render targets).
+
+const TYPES = 6;
+const W = 64;                 // state texture width
+// Particle count (W × N/W texels); `count` query parameter, rounded to a multiple of W.
+const N = D.clamp(Math.round(D.param('count', 4096) / W) * W, 512, 16384);
+const H = N / W;
+
+const s = D.surface({ scale: 1, minScale: 0.6, maxScale: 1 });
+const gl = D.webgl2(s);
+D.requireFloatRT(gl);
+D.badge(`WebGL2 GPGPU · ${N.toLocaleString()} particles`);
+
+const PALETTE = [
+  [1.0, 0.25, 0.75], [0.45, 0.35, 1.0], [0.0, 0.85, 1.0],
+  [0.25, 1.0, 0.55], [1.0, 0.85, 0.2], [1.0, 0.4, 0.2],
+];
+
+const SIM_FS = `#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D uPos;
+uniform highp sampler2D uVel;
+uniform float uAttract[${TYPES * TYPES}];
+uniform float uRMax;
+uniform float uBeta;
+uniform float uForce;
+uniform float uFriction;
+uniform float uDt;
+uniform vec4 uPoke;          // xyz = point, w = strength (outward kick)
+layout(location = 0) out vec4 oPos;
+layout(location = 1) out vec4 oVel;
+
+void main() {
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  vec4 P = texelFetch(uPos, c, 0);
+  vec3 v = texelFetch(uVel, c, 0).xyz;
+  int row = int(P.w + 0.5) * ${TYPES};
+  vec3 f = vec3(0.0);
+  for (int y = 0; y < ${H}; y++) {
+    for (int x = 0; x < ${W}; x++) {
+      vec4 Q = texelFetch(uPos, ivec2(x, y), 0);
+      vec3 d = Q.xyz - P.xyz;
+      float r = length(d);
+      if (r > 1e-4 && r < uRMax) {
+        float rn = r / uRMax;
+        float a = uAttract[row + int(Q.w + 0.5)];
+        float k = rn < uBeta
+          ? rn / uBeta - 1.0
+          : a * (1.0 - abs(2.0 * rn - 1.0 - uBeta) / (1.0 - uBeta));
+        f += d * (k / r);
+      }
+    }
+  }
+  f *= uRMax * uForce;
+
+  // Soft spherical container keeps the swarm on screen.
+  float L = length(P.xyz);
+  if (L > 1.0) f -= P.xyz / L * (L - 1.0) * 12.0;
+
+  // Tap: push particles away from the touched point.
+  vec3 dp = P.xyz - uPoke.xyz;
+  f += normalize(dp + 1e-5) * uPoke.w * exp(-dot(dp, dp) * 6.0);
+
+  v = v * uFriction + f * uDt;
+  oPos = vec4(P.xyz + v * uDt, P.w);
+  oVel = vec4(v, 0.0);
+}`;
+
+const DRAW_VS = `#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D uPos;
+uniform highp sampler2D uVel;
+uniform mat4 uVP;
+uniform float uSize;
+uniform vec3 uColors[${TYPES}];
+out vec3 vCol;
+void main() {
+  ivec2 c = ivec2(gl_VertexID % ${W}, gl_VertexID / ${W});
+  vec4 P = texelFetch(uPos, c, 0);
+  float speed = length(texelFetch(uVel, c, 0).xyz);
+  vec4 clip = uVP * vec4(P.xyz, 1.0);
+  gl_Position = clip;
+  gl_PointSize = clamp(uSize / clip.w, 1.0, 48.0);
+  vCol = mix(uColors[int(P.w + 0.5)], vec3(1.0), clamp(speed * 1.5, 0.0, 0.6));
+}`;
+
+const DRAW_FS = `#version 300 es
+precision highp float;
+in vec3 vCol;
+out vec4 o;
+void main() {
+  vec2 q = gl_PointCoord * 2.0 - 1.0;
+  float d = dot(q, q);
+  if (d > 1.0) discard;
+  float glow = exp(-d * 3.5);
+  float core = exp(-d * 18.0);
+  o = vec4(vCol * glow * 0.55 + core * 0.35, 1.0);
+}`;
+
+const FADE_FS = `#version 300 es
+precision highp float;
+uniform float uKeep;
+out vec4 o;
+void main() { o = vec4(uKeep); }`;
+
+const SHOW_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 o;
+uniform sampler2D uTex;
+void main() {
+  vec3 c = texture(uTex, vUv).rgb;
+  vec2 q = vUv - 0.5;
+  vec3 bg = mix(vec3(0.02, 0.015, 0.05), vec3(0.0), length(q) * 1.4);
+  c = 1.0 - exp(-c * 1.4);
+  o = vec4(bg + c, 1.0);
+}`;
+
+const sim = D.program(gl, D.FS_VS, SIM_FS);
+const draw = D.program(gl, DRAW_VS, DRAW_FS);
+const fade = D.program(gl, D.FS_VS, FADE_FS);
+const show = D.program(gl, D.FS_VS, SHOW_FS);
+
+// ---- state ----------------------------------------------------------------
+const stateTex = () => D.texture(gl, W, H, { internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT, filter: gl.NEAREST });
+const state = [0, 1].map(() => {
+  const pos = stateTex(), vel = stateTex();
+  return { pos, vel, fbo: D.framebuffer(gl, [pos, vel]) };
+});
+let cur = 0;
+
+function scatter() {
+  const pos = new Float32Array(N * 4), vel = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    // Uniform in a ball of radius 0.9.
+    let x, y, z;
+    do { x = Math.random() * 2 - 1; y = Math.random() * 2 - 1; z = Math.random() * 2 - 1; } while (x * x + y * y + z * z > 1);
+    pos.set([x * 0.9, y * 0.9, z * 0.9, i % TYPES], i * 4);
+  }
+  for (const st of state) {
+    gl.bindTexture(gl.TEXTURE_2D, st.pos);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.FLOAT, pos);
+    gl.bindTexture(gl.TEXTURE_2D, st.vel);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.FLOAT, vel);
+  }
+}
+
+// Hand-tuned rule sets that produce recognisable structures, plus a fully random option.
+const PRESETS = {
+  '세포': [
+    [0.8, -0.3, 0.2, 0, -0.4, 0.1], [0.5, 0.6, -0.4, 0.1, 0, -0.2], [-0.2, 0.7, 0.5, -0.5, 0.2, 0],
+    [0, -0.1, 0.6, 0.7, -0.6, 0.3], [0.3, 0, -0.2, 0.6, 0.6, -0.5], [-0.5, 0.2, 0, -0.2, 0.7, 0.8],
+  ],
+  '사냥꾼': [
+    [0.2, 1, 0, 0, 0, -1], [-1, 0.2, 1, 0, 0, 0], [0, -1, 0.2, 1, 0, 0],
+    [0, 0, -1, 0.2, 1, 0], [0, 0, 0, -1, 0.2, 1], [1, 0, 0, 0, -1, 0.2],
+  ],
+  '은하': [
+    [1, 0.4, 0.2, -0.1, -0.2, 0.3], [0.4, 1, 0.4, 0.2, -0.1, -0.2], [0.2, 0.4, 1, 0.4, 0.2, -0.1],
+    [-0.1, 0.2, 0.4, 1, 0.4, 0.2], [-0.2, -0.1, 0.2, 0.4, 1, 0.4], [0.3, -0.2, -0.1, 0.2, 0.4, 1],
+  ],
+};
+const presetNames = Object.keys(PRESETS);
+let attract = new Float32Array(TYPES * TYPES);
+const useMatrix = (rows) => { attract = new Float32Array(rows.flat()); };
+const randomMatrix = () => {
+  for (let i = 0; i < attract.length; i++) attract[i] = Math.random() * 2 - 1;
+};
+
+// ---- trails buffer ----------------------------------------------------------
+let trails = null;
+let trailKeep = 0.82;
+s.onResize = (w, h) => {
+  if (trails) trails.free();
+  trails = D.target(gl, w, h, D.hdrFormat(gl));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, trails.fbo);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+};
+s.onResize(s.width, s.height);
+
+// ---- controls -------------------------------------------------------------
+const cam = D.orbit(s.canvas, { dist: 3.2, pitch: 0.35, minDist: 1.2, maxDist: 8, autoRotate: 0.15 });
+let poke = [0, 0, 0, 0];
+cam.onTap = () => {
+  poke = [(Math.random() - 0.5) * 0.6, (Math.random() - 0.5) * 0.6, (Math.random() - 0.5) * 0.6, 6];
+};
+// The last option ('랜덤') rolls a fresh random matrix each time it is chosen.
+useMatrix(PRESETS[presetNames[0]]);
+const preset = D.cycle([...presetNames, '랜덤'], (i) => {
+  if (i === presetNames.length) randomMatrix();
+  else useMatrix(PRESETS[presetNames[i]]);
+}, 'preset');
+cam.onDoubleTap = () => {
+  preset.select(presetNames.length);
+  D.hint('새로운 상호작용 규칙이 생성되었습니다');
+};
+D.button('흩뿌리기', scatter);
+D.cycle(['잔상 보통', '잔상 길게', '잔상 끄기'], (i) => (trailKeep = [0.82, 0.93, 0][i]), 'trails');
+
+scatter();
+D.hint('드래그: 회전 · 핀치: 확대 · 탭: 충격파 · 두 번 탭: 새 규칙');
+
+// ---- frame ------------------------------------------------------------------
+const colors = new Float32Array(PALETTE.flat());
+D.loop(s, (t, dt) => {
+  cam.update(dt);
+
+  // Simulation step: read state[cur], write state[1 - cur].
+  const src = state[cur], dst = state[1 - cur];
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.BLEND);
+  D.bindTextures(gl, [src.pos, src.vel]);
+  sim.use().set({
+    uPos: 0, uVel: 1, uAttract: attract,
+    uRMax: 0.2, uBeta: 0.3, uForce: 6.0,
+    uFriction: Math.pow(0.5, 0.016 / 0.05), uDt: 0.016,
+    uPoke: poke,
+  });
+  D.drawFullscreen(gl);
+  poke[3] *= 0.6;
+  cur = 1 - cur;
+
+  // Fade the trails buffer, then splat particles additively.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, trails.fbo);
+  gl.viewport(0, 0, s.width, s.height);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ZERO, gl.SRC_COLOR);
+  fade.use().set({ uKeep: trailKeep });
+  D.drawFullscreen(gl);
+
+  gl.blendFunc(gl.ONE, gl.ONE);
+  D.bindTextures(gl, [dst.pos, dst.vel]);
+  draw.use().set({
+    uPos: 0, uVel: 1,
+    uVP: cam.viewProj(s.aspect),
+    uSize: 0.028 * s.height,
+    uColors: colors,
+  });
+  gl.drawArrays(gl.POINTS, 0, N);
+  gl.disable(gl.BLEND);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  D.bindTextures(gl, [trails.tex]);
+  show.use().set({ uTex: 0 });
+  D.drawFullscreen(gl);
+});
+</script>
+</body>
+</html>
