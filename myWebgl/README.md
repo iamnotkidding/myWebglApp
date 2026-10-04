@@ -1,6 +1,6 @@
 # myWebgl
 
-[webgpu.com](https://www.webgpu.com/) 쇼케이스에서 영감을 받은 실시간 GPU 그래픽 데모 9종을 담은 Android 앱입니다.
+[webgpu.com](https://www.webgpu.com/) 쇼케이스에서 영감을 받은 실시간 GPU 그래픽 데모 11종을 담은 Android 앱입니다.
 모든 데모는 APK에 포함된 순수 WebGL2/WebGPU 코드로 동작하며 **네트워크 없이(오프라인)** 실행됩니다
 (앱에 `INTERNET` 권한 없음, WebView 네트워크 차단).
 
@@ -15,6 +15,8 @@
 | 7 | `boids` | WebGPU Compute Boids | WGSL 컴퓨트 (미지원 시 WebGL2 대체) |
 | 8 | `life-sim` | 3D Life Sim | [kajukabla/3d-life-sim](https://github.com/kajukabla/3d-life-sim) 원본 번들 (MIT), WebGPU 필요 |
 | 9 | `fluid` | WebGPU Fluid | Stable Fluids 컴퓨트 셰이더 자체 구현, WebGPU 필요 |
+| 10 | `grassland` | Above the Grassland | 인스턴싱 풀 7만 개, 버텍스 바람, 날씨·자막·바람 소리 |
+| 11 | `patina` | Patina | 절차적 PBR 풍화(변색→녹청), 캐비티 마스크, GGX |
 
 ## 빌드
 
@@ -45,7 +47,7 @@ adb shell am start -n $A/.MainActivity -a $A.action.START \
 
 | extra | 값 | 설명 |
 |-------|----|------|
-| `demo` | `all`(기본), id, 파일명, 번호(1–9), 쉼표 목록 | 실행할 데모와 순서 |
+| `demo` | `all`(기본), id, 파일명, 번호(1–11), 쉼표 목록 | 실행할 데모와 순서 |
 | `duration` | `90`, `90s`, `5m`, `1h30m`, `0`/`off` | 데모당 테스트 시간. 0이면 STOP 전까지 계속 |
 | `loops` | `1`(기본)…, `0`/`inf` | 데모 목록 반복 횟수 |
 | `scale` | `auto`, `0.1`–`1`, `10`–`100`, `50%` | 렌더 해상도 고정(자동 조절 끔) |
@@ -85,6 +87,8 @@ adb shell am start -n $A/.MainActivity -a $A.action.SETTINGS                   #
 | boids | `backend`=webgpu / webgl, `count`=입자 수(64 단위) |
 | life-sim | 원본 옵션: `settings`=file-default-json / file-electric-current-json / file-ice-flower-json / file-viridian-aurora-json (또는 `Ice%20Flower`처럼 이름), `particles`=입자 수, `playing`=0 |
 | fluid | `color`=0 무지개 / 1 네온 / 2 불꽃 / 3 바다, `vortex`=0 보통 / 1 강하게 / 2 끄기, `shading`=0 입체 / 1 평면, `trails`=0 보통 / 1 길게, `sim`=격자(기본 128), `dye`=물감 해상도(기본 768) |
+| grassland | `weather`=0 황금 시간 / 1 흐린 오후 / 2 안개 새벽 / 3 폭풍 전야, `wind`=0–2.5, `letterbox`=0 시네마 / 1 전체, `subtitles`=0 켜짐 / 1 꺼짐, `count`=풀잎 수(기본 70000) |
+| patina | `object`=0 기둥 / 1 고리 매듭 / 2 장식 구, `light`=0 스튜디오 / 1 노을 / 2 흐린 야외, `age`=0–1(지정하면 자동 풍화 정지), `auto`=0 자동 / 1 정지 |
 
 번호 대신 버튼에 표시되는 이름(예: `time=한낮`)도 쓸 수 있습니다.
 
@@ -119,4 +123,4 @@ adb shell cat /sdcard/Android/data/com.qa.mywebgl/files/results.jsonl  # 누적 
   다시 빌드하려면 `tools/update-life-sim.sh [commit]`을 실행합니다. 앱 연동용 `life-sim-hook.js`(fps 통계, HUD 숨김)만 추가했고 원본 코드는 수정하지 않았습니다.
 - **WebGPU Fluid** — [kishimisu/WebGPU-Fluid-Simulation](https://github.com/kishimisu/WebGPU-Fluid-Simulation)에서 영감을 받았지만,
   해당 저장소에는 라이선스가 없어 코드를 가져오지 않고 공개 알고리즘(Jos Stam *Stable Fluids*, GPU Gems 38장)으로 새로 구현했습니다.
-- 나머지 데모 1–7은 [webgpu.com](https://www.webgpu.com/) 쇼케이스 작품의 아이디어만 참고한 자체 구현입니다.
+- 데모 1–7, 10(Above the Grassland), 11(Patina Preview)은 원본 소스·라이선스가 공개되지 않아 [webgpu.com](https://www.webgpu.com/) 쇼케이스 작품의 아이디어만 참고한 자체 구현입니다.

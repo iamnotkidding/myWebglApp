@@ -79,6 +79,31 @@
     return b;
   };
 
+  /**
+   * A labelled range slider in the bottom bar; `key` lets a query parameter set its start value.
+   * `fmt` formats the value readout. Returns the element; `.set(v)` moves it programmatically.
+   */
+  D.slider = (label, min, max, value, onInput, key, fmt = (v) => v.toFixed(2)) => {
+    const wrap = el('label', 'slider', bar);
+    el('span', '', wrap).textContent = label;
+    const input = el('input', '', wrap);
+    const out = el('span', 'val', wrap);
+    Object.assign(input, { type: 'range', min, max, step: (max - min) / 400 });
+    const set = (v) => {
+      input.value = v;
+      out.textContent = fmt(+v);
+      onInput(+v);
+    };
+    input.addEventListener('input', () => set(input.value));
+    if (key && D.qs.has(key)) {
+      const q = parseFloat(D.qs.get(key));
+      if (Number.isFinite(q)) value = clamp(q, min, max);
+    }
+    set(value);
+    wrap.set = set;
+    return wrap;
+  };
+
   D.failed = false;
   D.errorText = null;
   const showError = (msg) => {

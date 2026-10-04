@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Above the Grassland</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="common.css">
+</head>
+<body>
+<script src="common.js"></script>
+<script>
+'use strict';
+// A slow cinematic glide just above an endless grass field. Every blade is an instanced
+// triangle strip shaped and bent by wind entirely in the vertex shader; the field wraps around
+// the camera in two tiles (dense near, sparse far) so it never ends. Sky, clouds, fog and
+// backlit translucency change with the weather preset; subtitles and wind sound set the mood.
+
+const COUNT = D.clamp(Math.round(D.param('count', 70000)), 5000, 400000);
+const NEAR = Math.round(COUNT * 0.6);        // blades in the dense tile around the camera
+const TILE_NEAR = 18, TILE_FAR = 110;        // tile sizes in metres
+const SEG = 5;                               // blade segments → 2*SEG+1 strip vertices
+const MOTES = 700;
+
+const s = D.surface({ scale: 1, minScale: 0.55, maxScale: 1 });
+const gl = D.webgl2(s, { antialias: true, depth: true });
+D.badge(`WebGL2 · ${COUNT.toLocaleString()} instanced grass blades`);
+
+// Same terrain in JS (camera height) and GLSL (ground, blades): a sum of sines is exact in both.
+const TERRAIN_GLSL = `
+float terrain(vec2 p) {
+  return 1.6 * sin(p.x * 0.045) * cos(p.y * 0.037) + 0.8 * sin(p.x * 0.11 + p.y * 0.07) + 0.4 * sin(p.y * 0.17 - p.x * 0.05);
+}`;
+const terrain = (x, z) =>
+  1.6 * Math.sin(x * 0.045) * Math.cos(z * 0.037) + 0.8 * Math.sin(x * 0.11 + z * 0.07) + 0.4 * Math.sin(z * 0.17 - x * 0.05);
+
+// Weather presets; every field is blended smoothly when the preset changes.
+const WEATHER = [
+  { name: '황금 시간', sun: [0.25, 0.14, -1], sunCol: [1.7, 1.08, 0.6], top: [0.22, 0.36, 0.62], hor: [1.0, 0.72, 0.46],
+    fog: 0.011, tip: [0.78, 0.68, 0.3], dark: [0.07, 0.11, 0.03], amb: [0.32, 0.3, 0.28], wind: 0.8, clouds: 0.35 },
+  { name: '흐린 오후', sun: [0.3, 0.55, -0.6], sunCol: [0.75, 0.76, 0.78], top: [0.45, 0.5, 0.56], hor: [0.7, 0.73, 0.76],
+    fog: 0.02, tip: [0.48, 0.62, 0.27], dark: [0.06, 0.1, 0.04], amb: [0.55, 0.58, 0.62], wind: 1.2, clouds: 0.9 },
+  { name: '안개 새벽', sun: [-0.35, 0.06, -1], sunCol: [1.3, 0.85, 0.75], top: [0.32, 0.38, 0.55], hor: [0.88, 0.76, 0.76],
+    fog: 0.055, tip: [0.42, 0.58, 0.34], dark: [0.06, 0.09, 0.06], amb: [0.45, 0.45, 0.5], wind: 0.3, clouds: 0.15 },
+  { name: '폭풍 전야', sun: [0.5, 0.22, -0.7], sunCol: [1.1, 0.78, 0.5], top: [0.1, 0.12, 0.17], hor: [0.34, 0.32, 0.31],
+    fog: 0.024, tip: [0.52, 0.56, 0.26], dark: [0.05, 0.07, 0.03], amb: [0.2, 0.22, 0.28], wind: 2.3, clouds: 1.0 },
+];
+
+const COMMON_GLSL = `${D.GLSL_NOISE}${TERRAIN_GLSL}
+uniform mat4 uVP;
+uniform vec3 uCam;
+uniform float uTime;
+uniform vec3 uSunDir, uSunCol, uSkyTop, uSkyHor, uAmb, uTip, uDark;
+uniform float uFog;
+vec3 fogColor(vec3 rd) {
+  float sun = pow(max(dot(rd, uSunDir), 0.0), 6.0);
+  return mix(uSkyHor, uSunCol * 0.85, sun * 0.6);
+}
+vec3 applyFog(vec3 col, vec3 world) {
+  vec3 d = world - uCam;
+  float f = 1.0 - exp(-length(d) * uFog);
+  return mix(col, fogColor(normalize(d)), f);
+}`;
+
+const GRASS_VS = `#version 300 es
+precision highp float;
+${COMMON_GLSL}
+uniform vec2 uWindDir;
+uniform float uWind;
+out vec3 vWorld;
+out vec3 vN;
+out float vT;
+out float vVar;
+out float vFlower;
+void main() {
+  float id = float(gl_InstanceID);
+  bool nearTile = gl_InstanceID < ${NEAR};
+  float tile = nearTile ? ${TILE_NEAR}.0 : ${TILE_FAR}.0;
+  vec2 seed = vec2(hash12(vec2(id, 1.7)), hash12(vec2(id, 9.3))) * tile;
+  // Wrap the blade into the tile centred on the camera, so the field follows us forever.
+  vec2 rel = (fract((seed - uCam.xz) / tile + 0.5) - 0.5) * tile;
+  if (!nearTile && max(abs(rel.x), abs(rel.y)) < ${TILE_NEAR * 0.45}) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
+  vec2 root = uCam.xz + rel;
+  float r1 = hash12(vec2(id, 3.1)), r2 = hash12(vec2(id, 5.7)), r3 = hash12(vec2(id, 7.9));
+  float clump = noise2(root * 0.22);
+  float h = (0.35 + 0.55 * r1) * (0.55 + 0.9 * clump) * (nearTile ? 1.0 : 1.3);
+  float w = (nearTile ? 0.032 : 0.11) * (0.7 + 0.6 * r2);
+  float ang = r3 * 6.2831853;
+  vec2 face = vec2(cos(ang), sin(ang));
+  vec2 side = vec2(-face.y, face.x);
+
+  int vid = gl_VertexID;
+  float t = float(vid / 2) / ${SEG}.0;
+  float sideSign = (vid % 2 == 0) ? -1.0 : 1.0;
+  if (vid == ${2 * SEG}) { t = 1.0; sideSign = 0.0; }
+
+  // Wind: slow noise gusts plus travelling waves sweeping across the field.
+  float gust = noise2(root * 0.07 - uWindDir * uTime * 0.8);
+  float wave = 0.5 + 0.5 * sin(dot(root, uWindDir) * 0.32 - uTime * 2.1 + gust * 4.0);
+  float bend = uWind * (0.12 + 0.55 * gust) * (0.5 + 0.5 * wave) + 0.08 + 0.15 * r2;
+  bend += sin(uTime * (2.0 + r1 * 3.0) + id) * 0.04 * uWind; // per-blade flutter
+  vec2 dir = normalize(uWindDir + face * 0.4);
+  float bt = bend * t * t;
+  vec3 base = vec3(root.x, terrain(root), root.y);
+  vec3 p = base + vec3(dir.x * bt * h, h * t * (1.0 - 0.38 * min(bend, 1.5) * t), dir.y * bt * h);
+  p.xz += side * sideSign * w * (1.0 - t * 0.85);
+
+  vec3 tangent = normalize(vec3(dir.x * 2.0 * bend * t * h, h, dir.y * 2.0 * bend * t * h));
+  vec3 n = normalize(cross(vec3(side.x, 0.0, side.y), tangent));
+  n = normalize(n + vec3(side.x, 0.0, side.y) * sideSign * 0.35); // rounded blade
+
+  vWorld = p;
+  vN = n;
+  vT = t;
+  vVar = r1;
+  vFlower = (nearTile && r2 > 0.985) ? r3 : -1.0;
+  gl_Position = uVP * vec4(p, 1.0);
+}`;
+
+const GRASS_FS = `#version 300 es
+precision highp float;
+${COMMON_GLSL}
+in vec3 vWorld;
+in vec3 vN;
+in float vT;
+in float vVar;
+in float vFlower;
+out vec4 o;
+void main() {
+  vec3 V = normalize(uCam - vWorld);
+  vec3 n = dot(vN, V) < 0.0 ? -vN : vN;
+  vec3 col = mix(uDark, uTip * (0.8 + 0.4 * vVar), smoothstep(0.0, 1.0, vT));
+  if (vFlower >= 0.0 && vT > 0.88) {
+    col = vFlower < 0.5 ? vec3(0.95, 0.92, 0.8) : vec3(0.95, 0.75, 0.25);
+  }
+  float diff = max(dot(n, uSunDir), 0.0);
+  float trans = pow(max(dot(-V, uSunDir), 0.0), 3.0) * vT * vT;   // backlit glow at the tips
+  float ao = mix(0.28, 1.0, vT);
+  vec3 lit = col * (uAmb * ao + uSunCol * diff * 0.75 * ao) + col * uSunCol * trans * 1.3;
+  o = vec4(applyFog(lit, vWorld), 1.0);
+}`;
+
+const GROUND_VS = `#version 300 es
+precision highp float;
+${COMMON_GLSL}
+layout(location = 0) in vec2 aGrid;
+uniform vec2 uOrigin;
+out vec3 vWorld;
+void main() {
+  vec2 xz = uOrigin + aGrid;
+  vWorld = vec3(xz.x, terrain(xz) - 0.02, xz.y);
+  gl_Position = uVP * vec4(vWorld, 1.0);
+}`;
+const GROUND_FS = `#version 300 es
+precision highp float;
+${COMMON_GLSL}
+in vec3 vWorld;
+out vec4 o;
+void main() {
+  vec3 n = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
+  if (n.y < 0.0) n = -n;
+  float v = noise2(vWorld.xz * 0.6) * 0.5 + noise2(vWorld.xz * 0.08) * 0.5;
+  vec3 col = mix(uTip * 0.35, uTip * 0.7, v);
+  vec3 lit = col * (uAmb * 0.7 + uSunCol * max(dot(n, uSunDir), 0.0) * 0.6);
+  o = vec4(applyFog(lit, vWorld), 1.0);
+}`;
+
+const SKY_FS = `#version 300 es
+precision highp float;
+${COMMON_GLSL}
+in vec2 vUv;
+out vec4 o;
+uniform mat4 uInvVP;
+uniform float uClouds;
+uniform vec2 uWindDir;
+float fbm(vec2 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 5; i++) { s += a * noise2(p); p = p * 2.02 + 3.1; a *= 0.5; } return s; }
+void main() {
+  vec4 w = uInvVP * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
+  vec3 rd = normalize(w.xyz / w.w - uCam);
+  float up = max(rd.y, 0.0);
+  vec3 col = mix(uSkyHor, uSkyTop, pow(up, 0.55));
+  float sd = max(dot(rd, uSunDir), 0.0);
+  col += uSunCol * (pow(sd, 2500.0) * 3.0 + pow(sd, 120.0) * 0.3 + pow(sd, 8.0) * 0.12);
+  if (rd.y > 0.0) {
+    vec2 cp = rd.xz / (rd.y + 0.08) * 1.6 + uWindDir * uTime * 0.03;
+    float c = smoothstep(1.0 - uClouds * 0.75, 1.25, fbm(cp) + 0.35);
+    vec3 cloudCol = mix(uSkyHor * 0.9, uSunCol * 0.9 + 0.2, pow(sd, 3.0) * 0.6 + 0.2) * mix(1.0, 0.55, uClouds * uClouds);
+    col = mix(col, cloudCol, c * smoothstep(0.0, 0.18, rd.y));
+  }
+  col = mix(col, fogColor(rd), smoothstep(0.12, -0.02, rd.y));
+  o = vec4(col, 1.0);
+}`;
+
+const MOTE_VS = `#version 300 es
+precision highp float;
+${COMMON_GLSL}
+uniform float uScale;
+out float vA;
+void main() {
+  float id = float(gl_VertexID);
+  vec2 seed = vec2(hash12(vec2(id, 2.3)), hash12(vec2(id, 4.1))) * 24.0;
+  vec2 rel = (fract((seed - uCam.xz) / 24.0 + 0.5) - 0.5) * 24.0;
+  vec2 xz = uCam.xz + rel + vec2(sin(uTime * 0.3 + id), cos(uTime * 0.23 + id * 1.3)) * 0.4;
+  float y = terrain(xz) + 0.4 + 2.5 * hash12(vec2(id, 6.6)) + sin(uTime * 0.5 + id * 0.7) * 0.25;
+  vec4 clip = uVP * vec4(xz.x, y, xz.y, 1.0);
+  gl_Position = clip;
+  gl_PointSize = clamp(uScale / clip.w, 1.0, 14.0);
+  float flicker = 0.5 + 0.5 * sin(uTime * 2.0 + id * 3.7);
+  vA = flicker * (1.0 - smoothstep(6.0, 12.0, length(rel)));
+}`;
+const MOTE_FS = `#version 300 es
+precision highp float;
+${COMMON_GLSL}
+in float vA;
+out vec4 o;
+void main() {
+  vec2 q = gl_PointCoord * 2.0 - 1.0;
+  float d = dot(q, q);
+  if (d > 1.0) discard;
+  o = vec4(uSunCol * 0.6 * exp(-d * 3.0) * vA, 1.0);
+}`;
+
+const VIGNETTE_FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 o;
+void main() {
+  vec2 q = vUv - 0.5;
+  o = vec4(0.0, 0.0, 0.0, clamp(dot(q, q) * 1.3, 0.0, 0.6));
+}`;
+
+const grassProg = D.program(gl, GRASS_VS, GRASS_FS);
+const groundProg = D.program(gl, GROUND_VS, GROUND_FS);
+const skyProg = D.program(gl, D.FS_VS, SKY_FS);
+const moteProg = D.program(gl, MOTE_VS, MOTE_FS);
+const vignetteProg = D.program(gl, D.FS_VS, VIGNETTE_FS);
+
+// Ground: a 160 m grid that follows the camera in whole cells (so it never swims).
+const GRID = 160, CELLS = 128, STEP = GRID / CELLS;
+const grid = [];
+for (let z = 0; z < CELLS; z++) {
+  for (let x = 0; x < CELLS; x++) {
+    const x0 = x * STEP - GRID / 2, z0 = z * STEP - GRID / 2;
+    grid.push(x0, z0, x0 + STEP, z0, x0, z0 + STEP, x0 + STEP, z0, x0 + STEP, z0 + STEP, x0, z0 + STEP);
+  }
+}
+const groundVao = gl.createVertexArray();
+gl.bindVertexArray(groundVao);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(grid), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const emptyVao = gl.createVertexArray();
+
+// ---- controls -------------------------------------------------------------
+const look = D.orbit(s.canvas, {
+  yaw: 0, pitch: -0.06, dist: 1.4, minDist: 0.7, maxDist: 9,
+  minYaw: -1.3, maxYaw: 1.3, minPitch: -0.6, maxPitch: 0.6, autoRotate: 0,
+});
+// ---- subtitles (narration lines written for this demo) ---------------------
+const LINES = [
+  '바람은 이름을 묻지 않는다.',
+  '풀잎마다 지나간 계절이 조금씩 남아 있다.',
+  '빛이 기울면, 들판은 천천히 숨을 쉰다.',
+  '아무도 보지 않아도 초원은 흔들린다.',
+  '우리는 잠시, 그 위를 지나갈 뿐이다.',
+];
+const sub = document.createElement('div');
+sub.className = 'subtitle';
+document.body.appendChild(sub);
+let subIndex = -1, subNext = 2.5;
+
+let weather = 0, windMul = 1, cinema = 1, subtitlesOn = 1;
+const W = Object.fromEntries(Object.entries(WEATHER[0]).filter(([k]) => k !== 'name'));
+D.cycle(WEATHER.map((w) => w.name), (i) => (weather = i), 'weather');
+D.cycle(['시네마', '전체 화면'], (i) => (cinema = i ? 0 : 1), 'letterbox');
+D.cycle(['자막 켜짐', '자막 꺼짐'], (i) => {
+  subtitlesOn = i ? 0 : 1;
+  if (!subtitlesOn) sub.style.opacity = '0';
+}, 'subtitles');
+const audioBtn = D.button('바람 소리 켜기', () => toggleAudio());
+D.slider('바람', 0, 2.5, 1, (v) => (windMul = v), 'wind', (v) => `${Math.round(v * 100)}%`);
+D.hint('드래그: 둘러보기 · 핀치: 고도 · 버튼으로 날씨와 연출을 바꿔 보세요');
+
+// ---- wind sound: filtered noise whose loudness and brightness follow the gusts ----
+let audio = null;
+function toggleAudio() {
+  if (audio) {
+    audio.ctx.close();
+    audio = null;
+    audioBtn.textContent = '바람 소리 켜기';
+    return;
+  }
+  const ctx = new AudioContext();
+  const len = ctx.sampleRate * 3;
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  let last = 0;
+  for (let i = 0; i < len; i++) {
+    last = (last + 0.02 * (Math.random() * 2 - 1)) / 1.02; // brown noise
+    data[i] = last * 3.5;
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.loop = true;
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+  src.connect(filter).connect(gain).connect(ctx.destination);
+  src.start();
+  audio = { ctx, filter, gain };
+  audioBtn.textContent = '바람 소리 끄기';
+}
+
+// ---- frame -------------------------------------------------------------------
+const mix = (a, b, k) => (Array.isArray(a) ? a.map((v, i) => v + (b[i] - v) * k) : a + (b - a) * k);
+const invert = (m) => {
+  // 4×4 inverse (column-major), for reconstructing sky rays.
+  const a = m, o = new Float32Array(16);
+  const b00 = a[0] * a[5] - a[1] * a[4], b01 = a[0] * a[6] - a[2] * a[4], b02 = a[0] * a[7] - a[3] * a[4];
+  const b03 = a[1] * a[6] - a[2] * a[5], b04 = a[1] * a[7] - a[3] * a[5], b05 = a[2] * a[7] - a[3] * a[6];
+  const b06 = a[8] * a[13] - a[9] * a[12], b07 = a[8] * a[14] - a[10] * a[12], b08 = a[8] * a[15] - a[11] * a[12];
+  const b09 = a[9] * a[14] - a[10] * a[13], b10 = a[9] * a[15] - a[11] * a[13], b11 = a[10] * a[15] - a[11] * a[14];
+  const det = 1 / (b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06);
+  o[0] = (a[5] * b11 - a[6] * b10 + a[7] * b09) * det; o[1] = (a[2] * b10 - a[1] * b11 - a[3] * b09) * det;
+  o[2] = (a[13] * b05 - a[14] * b04 + a[15] * b03) * det; o[3] = (a[10] * b04 - a[9] * b05 - a[11] * b03) * det;
+  o[4] = (a[6] * b08 - a[4] * b11 - a[7] * b07) * det; o[5] = (a[0] * b11 - a[2] * b08 + a[3] * b07) * det;
+  o[6] = (a[14] * b02 - a[12] * b05 - a[15] * b01) * det; o[7] = (a[8] * b05 - a[10] * b02 + a[11] * b01) * det;
+  o[8] = (a[4] * b10 - a[5] * b08 + a[7] * b06) * det; o[9] = (a[1] * b08 - a[0] * b10 - a[3] * b06) * det;
+  o[10] = (a[12] * b04 - a[13] * b02 + a[15] * b00) * det; o[11] = (a[9] * b02 - a[8] * b04 - a[11] * b00) * det;
+  o[12] = (a[5] * b07 - a[4] * b09 - a[6] * b06) * det; o[13] = (a[0] * b09 - a[1] * b07 + a[2] * b06) * det;
+  o[14] = (a[13] * b01 - a[12] * b03 - a[14] * b00) * det; o[15] = (a[8] * b03 - a[9] * b01 + a[10] * b00) * det;
+  return o;
+};
+
+D.loop(s, (time, dt) => {
+  look.update(dt);
+  const k = Math.min(1, dt * 0.8);
+  for (const key of Object.keys(W)) W[key] = mix(W[key], WEATHER[weather][key], k);
+  const wind = W.wind * windMul;
+
+  // Camera glides forward along a gentle S-curve, just above the grass.
+  const speed = 1.3;
+  const cx = 7 * Math.sin(time * 0.045), cz = -time * speed;
+  const vx = 7 * 0.045 * Math.cos(time * 0.045), vz = -speed;
+  const ground = terrain(cx, cz);
+  const eye = [cx, ground + look.dist + 0.06 * Math.sin(time * 0.7), cz];
+  const heading = Math.atan2(vx, -vz) + look.yaw;
+  const dir = [Math.sin(heading) * Math.cos(look.pitch), Math.sin(look.pitch), -Math.cos(heading) * Math.cos(look.pitch)];
+  const view = D.mat4.lookAt(eye, D.vec3.add(eye, dir));
+  const proj = D.mat4.perspective(s.aspect < 1 ? 1.05 : 0.8, s.aspect, 0.05, 260);
+  const vp = D.mat4.mul(proj, view);
+  const windDir = [Math.cos(0.6 + Math.sin(time * 0.03) * 0.4), Math.sin(0.6 + Math.sin(time * 0.03) * 0.4)];
+
+  const u = {
+    uVP: vp, uCam: eye, uTime: time,
+    uSunDir: D.vec3.norm(W.sun), uSunCol: W.sunCol, uSkyTop: W.top, uSkyHor: W.hor, uAmb: W.amb,
+    uTip: W.tip, uDark: W.dark, uFog: W.fog, uWindDir: windDir, uWind: wind,
+  };
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, s.width, s.height);
+  gl.disable(gl.SCISSOR_TEST);
+  gl.disable(gl.BLEND);
+  gl.disable(gl.CULL_FACE);
+  gl.clear(gl.DEPTH_BUFFER_BIT);
+
+  gl.disable(gl.DEPTH_TEST);
+  skyProg.use().set({ ...u, uInvVP: invert(vp), uClouds: W.clouds });
+  D.drawFullscreen(gl);
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthMask(true);
+  groundProg.use().set({ ...u, uOrigin: [Math.floor(cx / STEP) * STEP, Math.floor(cz / STEP) * STEP] });
+  gl.bindVertexArray(groundVao);
+  gl.drawArrays(gl.TRIANGLES, 0, grid.length / 2);
+
+  grassProg.use().set(u);
+  gl.bindVertexArray(emptyVao);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 2 * SEG + 1, COUNT);
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);
+  gl.depthMask(false);
+  moteProg.use().set({ ...u, uScale: s.height * 0.012 });
+  gl.drawArrays(gl.POINTS, 0, MOTES);
+  gl.depthMask(true);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  vignetteProg.use();
+  D.drawFullscreen(gl);
+  gl.disable(gl.BLEND);
+
+  // Letterbox bars (cinematic framing) drawn as scissored clears.
+  if (cinema) {
+    const bar = Math.round(s.height * 0.085);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.clearColor(0, 0, 0, 1);
+    gl.scissor(0, 0, s.width, bar);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.scissor(0, s.height - bar, s.width, bar);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.SCISSOR_TEST);
+  }
+
+  // Subtitles: one line every ~9 s, faded in and out.
+  if (subtitlesOn && time > subNext) {
+    if (sub.style.opacity === '1') {
+      sub.style.opacity = '0';
+      subNext = time + 2.5;
+    } else {
+      subIndex = (subIndex + 1) % LINES.length;
+      sub.textContent = LINES[subIndex];
+      sub.style.opacity = '1';
+      subNext = time + 6.5;
+    }
+  }
+
+  if (audio) {
+    const g = 0.05 + 0.12 * Math.min(wind, 2.5) * (0.6 + 0.4 * Math.sin(time * 0.7) * Math.sin(time * 0.31));
+    audio.gain.gain.setTargetAtTime(g, audio.ctx.currentTime, 0.3);
+    audio.filter.frequency.setTargetAtTime(250 + 500 * wind * (0.7 + 0.3 * Math.sin(time * 0.5)), audio.ctx.currentTime, 0.4);
+  }
+});
+</script>
+</body>
+</html>

@@ -98,4 +98,22 @@ val demos = listOf(
         accent = listOf(Color(0xFFFF4FD8), Color(0xFF3AE0FF), Color(0xFF1B0B3A)),
         asset = "fluid.html",
     ),
+    Demo(
+        id = "grassland",
+        title = "Above the Grassland",
+        subtitle = "끝없는 초원 위를 낮게 미끄러지는 시네마틱 비행. 바람에 일렁이는 풀잎, 날씨 프리셋, 자막과 바람 소리가 분위기를 만듭니다.",
+        inspiredBy = "Above the Grassland",
+        tech = listOf("Instancing", "Vertex wind", "Volumetric fog"),
+        accent = listOf(Color(0xFFE8C46A), Color(0xFF8DB255), Color(0xFF2B3A1C)),
+        asset = "grassland.html",
+    ),
+    Demo(
+        id = "patina",
+        title = "Patina",
+        subtitle = "구리 조각이 세월에 따라 갈색으로 변색되고 홈과 빗물 자국을 따라 녹청이 번지는 과정을 실시간 절차적 PBR로 보여 줍니다.",
+        inspiredBy = "Patina Preview",
+        tech = listOf("Procedural PBR", "Cavity masks", "GGX"),
+        accent = listOf(Color(0xFF6FC2A6), Color(0xFFD9895F), Color(0xFF1E2A26)),
+        asset = "patina.html",
+    ),
 )
