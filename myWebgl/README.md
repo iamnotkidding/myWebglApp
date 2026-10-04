@@ -123,4 +123,5 @@ adb shell cat /sdcard/Android/data/com.qa.mywebgl/files/results.jsonl  # 누적 
   다시 빌드하려면 `tools/update-life-sim.sh [commit]`을 실행합니다. 앱 연동용 `life-sim-hook.js`(fps 통계, HUD 숨김)만 추가했고 원본 코드는 수정하지 않았습니다.
 - **WebGPU Fluid** — [kishimisu/WebGPU-Fluid-Simulation](https://github.com/kishimisu/WebGPU-Fluid-Simulation)에서 영감을 받았지만,
   해당 저장소에는 라이선스가 없어 코드를 가져오지 않고 공개 알고리즘(Jos Stam *Stable Fluids*, GPU Gems 38장)으로 새로 구현했습니다.
-- 데모 1–7, 10(Above the Grassland), 11(Patina Preview)은 원본 소스·라이선스가 공개되지 않아 [webgpu.com](https://www.webgpu.com/) 쇼케이스 작품의 아이디어만 참고한 자체 구현입니다.
+- 데모 1–7은 [webgpu.com](https://www.webgpu.com/) 쇼케이스 작품의 아이디어만 참고한 자체 구현입니다.
+- 데모 10(Above the Grassland), 11(Patina Preview)은 원본 소스·라이선스가 공개되어 있지 않아 코드를 가져오지 않고 쇼케이스 설명만 참고해 새로 구현했습니다.
